@@ -1,0 +1,33 @@
+plugins {
+    id("java")
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly("net.portswigger.burp.extensions:montoya-api:2026.2")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.2")
+
+    testImplementation(platform("org.junit:junit-bom:5.11.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testImplementation("net.portswigger.burp.extensions:montoya-api:2026.2")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.withType<JavaCompile>().configureEach {
+    sourceCompatibility = "21"
+    targetCompatibility = "21"
+    options.encoding = "UTF-8"
+}
+
+tasks.named<Jar>("jar") {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(configurations.runtimeClasspath.get().filter { it.isDirectory })
+    from(configurations.runtimeClasspath.get().filterNot { it.isDirectory }.map { zipTree(it) })
+}
+
+tasks.test {
+    useJUnitPlatform()
+}

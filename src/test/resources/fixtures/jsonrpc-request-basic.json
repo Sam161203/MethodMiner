@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "method": "user.getProfile",
+  "params": {
+    "userId": "12345",
+    "includeSecrets": false
+  },
+  "id": 19
+}
