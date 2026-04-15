@@ -1,8 +1,8 @@
-# LogicHunter (Burp Suite Montoya Extension)
+# MethodMiner (Burp Suite Montoya Extension)
 
-LogicHunter is a passive Burp Suite extension for JSON-RPC traffic analysis focused on business-logic, access-control, and workflow abuse discovery.
+MethodMiner is a passive Burp Suite extension for JSON-RPC traffic analysis focused on business-logic, access-control, and workflow abuse discovery.
 
-## Why LogicHunter?
+## Why MethodMiner?
 
 Bug bounty hunters regularly test JSON-RPC APIs for broken access control: log in as admin, capture requests, log in as low-privilege user, capture requests, then compare. LogicHunter automates the tedious analysis part:
 
@@ -23,15 +23,6 @@ LogicHunter is intentionally passive and analyst-driven:
 
 ## MyGeotab Scope (Hard Filter)
 
-This build is tuned for the MyGeotab Bugcrowd program and only processes traffic for:
-
-- bugcrowd5.geotab.com
-- bugcrowd6.geotab.com
-- bugcrowd7.geotab.com
-- bugcrowd8.geotab.com
-- bugcrowd9.geotab.com
-- bugcrowd10.geotab.com
-- bugcrowd11.geotab.com
 
 Traffic outside this host set is ignored by capture, replay, and suggestion generation.
 
