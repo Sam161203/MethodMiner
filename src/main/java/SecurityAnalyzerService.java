@@ -245,7 +245,7 @@ public final class SecurityAnalyzerService implements AutoCloseable {
 
             registerSensitiveMethodHits();
 
-            AuthContextStore.AuthContext taggedContext = authContextStore.observeRecord(rawRecord, normalizedRecord.methodName());
+            AuthContextStore.AuthContext taggedContext = authContextStore.lookupContext(rawRecord.request().bodyText(), rawRecord.request().url());
             AuthContext authContext = extractAuthContext(rawRecord, objectMapper, taggedContext);
             addAuthContextObservation(authContext, normalizedRecord);
 

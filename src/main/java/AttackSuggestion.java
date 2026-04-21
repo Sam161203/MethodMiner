@@ -18,7 +18,17 @@ public record AttackSuggestion(
         String host,
         int confidenceScore,
         int effectivenessScore,
-        String repeaterRequest
+        String repeaterRequest,
+        String findingType,
+        String findingConfidence,
+        String sessionId,
+        String entityId,
+        String method,
+        String typeName,
+        String adminResponse,
+        String lowPrivResponse,
+        String payload,
+        String bugcrowdMarkdown
 ) {
     public String priorityDisplay() {
         return priorityLevel.displayName() + " (" + priorityScore + ")";
@@ -36,6 +46,10 @@ public record AttackSuggestion(
     }
 
     public String toFormattedFinding() {
+        if (bugcrowdMarkdown != null && !bugcrowdMarkdown.isBlank()) {
+            return bugcrowdMarkdown;
+        }
+
         StringBuilder builder = new StringBuilder();
         builder.append(findingTitle).append("\n\n");
         builder.append("Target host:\n");
@@ -77,6 +91,16 @@ public record AttackSuggestion(
         builder.append("Evidence:\n");
         builder.append("* ").append(evidence);
         return builder.toString();
+    }
+
+    public String effectivePayload() {
+        if (payload != null && !payload.isBlank()) {
+            return payload;
+        }
+        if (exploitPayload != null && !exploitPayload.isBlank()) {
+            return exploitPayload;
+        }
+        return repeaterRequest == null ? "" : repeaterRequest;
     }
 
     public enum Confidence {

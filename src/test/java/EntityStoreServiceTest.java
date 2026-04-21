@@ -15,34 +15,51 @@ class EntityStoreServiceTest {
     private final JsonRpcParser parser = new JsonRpcParser(objectMapper, 1024);
 
     @Test
-    void tracksEntityReuseAcrossMethodsAndContexts() throws Exception {
-        try (EntityStoreService entityStoreService = new EntityStoreService(objectMapper, new NoopLogging())) {
+    void tracksEntityReuseAcrossMethodsAndSessions() throws Exception {
+        AuthContextStore authContextStore = new AuthContextStore(objectMapper);
+        try (EntityStoreService entityStoreService = new EntityStoreService(objectMapper, new NoopLogging(), authContextStore)) {
             JsonRpcRecord first = createRecord(
-                    "user.lookup",
-                    List.of("Host: example.test", "Cookie: sessionId=user-a"),
-                    "{\"params\":{\"email\":\"alice@example.test\"}}",
+                    "rec-1",
+                    "Device.Get",
+                    "Device",
+                    "sid-a",
+                    "db-a",
+                    "alice",
+                    "u-100",
                     200,
-                    "{\"result\":{\"userId\":\"u-100\",\"tenantId\":\"t-1\"},\"id\":1}"
+                    "{\"result\":[{\"id\":\"u-100\",\"typeName\":\"User\"}],\"id\":1}"
             );
 
             JsonRpcRecord second = createRecord(
-                    "report.fetch",
-                    List.of("Host: example.test", "Cookie: sessionId=user-a"),
-                    "{\"params\":{\"userId\":\"u-100\"}}",
+                    "rec-2",
+                    "User.Get",
+                    "User",
+                    "sid-a",
+                    "db-a",
+                    "alice",
+                    "u-100",
                     200,
-                    "{\"result\":{\"reportId\":\"r-7\",\"tenantId\":\"t-1\"},\"id\":1}"
+                    "{\"result\":[{\"id\":\"u-100\",\"typeName\":\"User\"}],\"id\":2}"
             );
 
             JsonRpcRecord third = createRecord(
-                    "report.fetch",
-                    List.of("Host: example.test", "Cookie: sessionId=user-b"),
-                    "{\"params\":{\"userId\":\"u-100\"}}",
-                    403,
-                    "{\"error\":{\"code\":403,\"message\":\"forbidden\"},\"id\":1}"
+                    "rec-3",
+                    "User.Get",
+                    "User",
+                    "sid-b",
+                    "db-b",
+                    "bob",
+                    "u-100",
+                    200,
+                    "{\"result\":[{\"id\":\"u-100\",\"typeName\":\"User\"}],\"id\":3}"
             );
 
+            // Prime AuthContextStore first — EntityStoreService now uses non-mutating lookupContext
+            authContextStore.observeRecord(first, "Device.Get");
             entityStoreService.ingestRecordSync(first, parser.normalize(first));
+            authContextStore.observeRecord(second, "User.Get");
             entityStoreService.ingestRecordSync(second, parser.normalize(second));
+            authContextStore.observeRecord(third, "User.Get");
             entityStoreService.ingestRecordSync(third, parser.normalize(third));
 
             List<EntityStoreService.EntityRow> rows = entityStoreService.snapshotRows();
@@ -60,9 +77,9 @@ class EntityStoreServiceTest {
         }
     }
 
-    private EntityStoreService.EntityRow findEntity(List<EntityStoreService.EntityRow> rows, String preview) {
+    private EntityStoreService.EntityRow findEntity(List<EntityStoreService.EntityRow> rows, String entityId) {
         for (EntityStoreService.EntityRow row : rows) {
-            if (preview.equals(row.preview())) {
+            if (entityId.equals(row.entityKey())) {
                 return row;
             }
         }
@@ -70,21 +87,43 @@ class EntityStoreServiceTest {
     }
 
     private JsonRpcRecord createRecord(
+            String recordId,
             String method,
-            List<String> headers,
-            String paramsSuffix,
+            String typeName,
+            String sessionId,
+            String database,
+            String userName,
+            String entityId,
             Integer responseStatus,
             String responseBody
     ) {
-        String requestBody = "{\"jsonrpc\":\"2.0\",\"method\":\"" + method + "\"," + paramsSuffix.substring(1);
+        String requestBody = "{"
+                + "\"jsonrpc\":\"2.0\"," 
+                + "\"method\":\"" + method + "\"," 
+                + "\"params\":{"
+                + "\"typeName\":\"" + typeName + "\"," 
+                + "\"search\":{\"id\":\"" + entityId + "\"},"
+                + "\"credentials\":{"
+                + "\"database\":\"" + database + "\"," 
+                + "\"sessionId\":\"" + sessionId + "\"," 
+                + "\"userName\":\"" + userName + "\""
+                + "}"
+                + "},"
+                + "\"id\":1"
+                + "}";
 
-        String rawRequest = "POST /rpc HTTP/1.1\\r\\n"
-                + String.join("\\r\\n", headers)
-                + "\\r\\nContent-Type: application/json\\r\\n\\r\\n"
+        List<String> headers = List.of(
+                "Host: api.example.test",
+                "Content-Type: application/json"
+        );
+
+        String rawRequest = "POST /apiv1 HTTP/1.1\r\n"
+                + String.join("\r\n", headers)
+                + "\r\n\r\n"
                 + requestBody;
 
         JsonRpcRecord.RequestData requestData = JsonRpcRecord.RequestData.fromCaptured(
-                "https://example.test/rpc",
+                "https://api.example.test/apiv1",
                 "POST",
                 headers,
                 requestBody,
@@ -93,8 +132,8 @@ class EntityStoreServiceTest {
                 rawRequest.getBytes(StandardCharsets.UTF_8)
         );
 
-        String responseRaw = "HTTP/1.1 " + responseStatus + "\\r\\n"
-                + "Content-Type: application/json\\r\\n\\r\\n"
+        String responseRaw = "HTTP/1.1 " + responseStatus + "\r\n"
+                + "Content-Type: application/json\r\n\r\n"
                 + responseBody;
 
         JsonRpcRecord.ResponseData responseData = JsonRpcRecord.ResponseData.fromCaptured(
@@ -107,7 +146,7 @@ class EntityStoreServiceTest {
         );
 
         return new JsonRpcRecord(
-                null,
+                recordId,
                 1,
                 Instant.now(),
                 "Proxy",

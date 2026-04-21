@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
@@ -15,6 +16,7 @@ import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.JTextPane;
 import javax.swing.ListSelectionModel;
 import javax.swing.RowFilter;
 import javax.swing.SwingUtilities;
@@ -36,6 +38,7 @@ import java.nio.file.Files;
 import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -59,10 +62,14 @@ public final class AttackPlannerTab extends JPanel {
 
     private final JTextField searchField = new JTextField(30);
     private final JLabel statusLabel = new JLabel("No suggestions yet");
+    private final JCheckBox safeModeToggle = new JCheckBox("Safe Mode", true);
 
     private final JTabbedPane detailTabs = new JTabbedPane();
     private final JTextArea payloadArea = buildMonoTextArea();
-    private final JTextArea evidenceArea = buildMonoTextArea();
+    private final JTextArea evidenceSummaryArea = buildMonoTextArea();
+    private final JTextArea adminResponseArea = buildMonoTextArea();
+    private final JTextArea lowPrivResponseArea = buildMonoTextArea();
+    private final JTextPane diffPane = new JTextPane();
     private final JTextArea chainsArea = buildMonoTextArea();
 
     private final AtomicBoolean refreshQueued = new AtomicBoolean(false);
@@ -113,8 +120,10 @@ public final class AttackPlannerTab extends JPanel {
         JButton recomputeBtn = new JButton("Recompute");
         JButton copyPayloadBtn = new JButton("\uD83D\uDCCB Copy Payload");
         JButton copyCurlBtn = new JButton("\uD83D\uDCCB Copy cURL");
-        JButton copyHeadersBtn = new JButton("\uD83D\uDCCB Copy Headers");
+        JButton copyHeadersBtn = new JButton("\uD83D\uDCCB Copy Credentials");
         JButton sendRepeaterBtn = new JButton("\uD83D\uDD04 Send to Repeater");
+        JButton executeSelectedBtn = new JButton("Run Active Check");
+        JButton executeTopBtn = new JButton("Validate Top 5");
         JButton exportBtn = new JButton("Export Selected");
 
         refreshBtn.addActionListener(e -> refreshNow());
@@ -123,7 +132,13 @@ public final class AttackPlannerTab extends JPanel {
         copyCurlBtn.addActionListener(e -> copyCurlToClipboard());
         copyHeadersBtn.addActionListener(e -> copyHeadersToClipboard());
         sendRepeaterBtn.addActionListener(e -> sendToRepeater());
+        executeSelectedBtn.addActionListener(e -> executeSelectedValidation());
+        executeTopBtn.addActionListener(e -> executeTopValidations());
         exportBtn.addActionListener(e -> exportSelectedSuggestion());
+
+        safeModeToggle.setSelected(suggestionService.isAttackSafeMode());
+        safeModeToggle.setEnabled(suggestionService.hasAttackExecutionService());
+        safeModeToggle.addActionListener(e -> suggestionService.setAttackSafeMode(safeModeToggle.isSelected()));
 
         controls.add(refreshBtn);
         controls.add(recomputeBtn);
@@ -131,6 +146,9 @@ public final class AttackPlannerTab extends JPanel {
         controls.add(copyCurlBtn);
         controls.add(copyHeadersBtn);
         controls.add(sendRepeaterBtn);
+        controls.add(executeSelectedBtn);
+        controls.add(executeTopBtn);
+        controls.add(safeModeToggle);
         controls.add(exportBtn);
 
         // Suggestion table
@@ -157,7 +175,7 @@ public final class AttackPlannerTab extends JPanel {
 
         // Detail sub-tabs
         detailTabs.addTab("\uD83D\uDCCB Payload", buildPayloadPanel());
-        detailTabs.addTab("\uD83D\uDD0D Evidence", new JScrollPane(evidenceArea));
+        detailTabs.addTab("\uD83D\uDD0D Evidence", buildEvidencePanel());
         detailTabs.addTab("\uD83D\uDD17 Chains", new JScrollPane(chainsArea));
         detailTabs.setSelectedIndex(0);
 
@@ -192,11 +210,42 @@ public final class AttackPlannerTab extends JPanel {
         payloadControls.add(copyAllBtn);
         payloadControls.add(copyCurlOnly);
         payloadControls.add(copyHttpBtn);
-        payloadControls.add(new JLabel("  \u2191 Payloads include YOUR real captured session tokens and entity IDs"));
+        payloadControls.add(new JLabel("  \u2191 Payloads use body credentials only (no Authorization/Cookie headers)"));
 
         panel.add(payloadControls, BorderLayout.NORTH);
         panel.add(new JScrollPane(payloadArea), BorderLayout.CENTER);
 
+        return panel;
+    }
+
+    private JPanel buildEvidencePanel() {
+        JPanel panel = new JPanel(new BorderLayout(4, 4));
+
+        evidenceSummaryArea.setBorder(BorderFactory.createTitledBorder("Finding Summary"));
+
+        adminResponseArea.setBorder(BorderFactory.createTitledBorder("ADMIN Response"));
+        lowPrivResponseArea.setBorder(BorderFactory.createTitledBorder("LOW_PRIV Response"));
+
+        JSplitPane responseSplit = new JSplitPane(
+                JSplitPane.HORIZONTAL_SPLIT,
+                new JScrollPane(adminResponseArea),
+                new JScrollPane(lowPrivResponseArea)
+        );
+        responseSplit.setResizeWeight(0.5);
+
+        diffPane.setEditable(false);
+        diffPane.setContentType("text/html");
+        diffPane.setText("<html><body style='font-family:Consolas,monospace;'>Select a finding to view diff.</body></html>");
+        JScrollPane diffScroll = new JScrollPane(diffPane);
+        diffScroll.setBorder(BorderFactory.createTitledBorder("Diff Highlight"));
+
+        JSplitPane lowerSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, responseSplit, diffScroll);
+        lowerSplit.setResizeWeight(0.62);
+
+        JSplitPane outerSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(evidenceSummaryArea), lowerSplit);
+        outerSplit.setResizeWeight(0.38);
+
+        panel.add(outerSplit, BorderLayout.CENTER);
         return panel;
     }
 
@@ -262,25 +311,37 @@ public final class AttackPlannerTab extends JPanel {
         AttackSuggestion selected = getSelectedSuggestion();
         if (selected == null) {
             payloadArea.setText("");
-            evidenceArea.setText("");
+            evidenceSummaryArea.setText("");
+            adminResponseArea.setText("");
+            lowPrivResponseArea.setText("");
+            diffPane.setText("<html><body style='font-family:Consolas,monospace;'>Select a finding to view diff.</body></html>");
             chainsArea.setText("");
             return;
         }
 
         // Payload tab
-        payloadArea.setText(selected.exploitPayload());
+        payloadArea.setText(selected.effectivePayload());
         payloadArea.setCaretPosition(0);
 
-        // Evidence tab
-        evidenceArea.setText(buildEvidenceText(selected));
-        evidenceArea.setCaretPosition(0);
+        // Evidence tab (summary + side-by-side responses + highlighted diff)
+        evidenceSummaryArea.setText(buildEvidenceSummaryText(selected));
+        evidenceSummaryArea.setCaretPosition(0);
+
+        adminResponseArea.setText(truncateForDisplay(selected.adminResponse(), 16_000));
+        adminResponseArea.setCaretPosition(0);
+
+        lowPrivResponseArea.setText(truncateForDisplay(selected.lowPrivResponse(), 16_000));
+        lowPrivResponseArea.setCaretPosition(0);
+
+        diffPane.setText(buildDiffHtml(selected.adminResponse(), selected.lowPrivResponse()));
+        diffPane.setCaretPosition(0);
 
         // Chains tab
         chainsArea.setText(buildChainsText(selected));
         chainsArea.setCaretPosition(0);
     }
 
-    private String buildEvidenceText(AttackSuggestion suggestion) {
+    private String buildEvidenceSummaryText(AttackSuggestion suggestion) {
         StringBuilder sb = new StringBuilder();
 
         sb.append("=== ").append(suggestion.findingTitle()).append(" ===\n\n");
@@ -313,35 +374,84 @@ public final class AttackPlannerTab extends JPanel {
         sb.append("--- EVIDENCE ---\n");
         sb.append(suggestion.evidence()).append("\n\n");
 
-        // Add admin vs low-priv response comparison if available
-        Optional<SecurityAnalyzerService.MethodSecurityDetails> details =
-                securityAnalyzer.snapshotMethodDetails(suggestion.primaryMethod());
-        if (details.isPresent()) {
-            SecurityAnalyzerService.MethodSecurityDetails methodDetails = details.get();
-            sb.append("--- RESPONSE COMPARISON ---\n");
+        sb.append("--- RESPONSE DIFF SUMMARY ---\n");
+        sb.append(TextDiffUtil.summarizeDifferences(
+            suggestion.adminResponse(),
+            suggestion.lowPrivResponse(),
+            "ADMIN vs LOW_PRIV"
+        )).append("\n");
 
-            boolean hasAdmin = false;
-            boolean hasLowPriv = false;
-
-            for (SecurityAnalyzerService.SampleView sample : methodDetails.samples()) {
-                String role = sample.roleTag() == null ? "" : sample.roleTag().toUpperCase(Locale.ROOT);
-                if (role.contains("ADMIN") && !hasAdmin) {
-                    sb.append("\nADMIN response (status ").append(sample.statusCode()).append("):\n");
-                    sb.append(truncateForDisplay(sample.responseRaw(), 600));
-                    sb.append("\n");
-                    hasAdmin = true;
-                }
-                if ((role.contains("LOW") || role.contains("USER") || role.contains("GUEST")) && !hasLowPriv) {
-                    sb.append("\nLOW_PRIV response (status ").append(sample.statusCode()).append("):\n");
-                    sb.append(truncateForDisplay(sample.responseRaw(), 600));
-                    sb.append("\n");
-                    hasLowPriv = true;
-                }
-                if (hasAdmin && hasLowPriv) break;
+        Optional<SecurityAnalyzerService.MethodSecurityDetails> methodDetails =
+            securityAnalyzer.snapshotMethodDetails(suggestion.primaryMethod());
+        methodDetails.ifPresent(details -> {
+            sb.append("\n--- METHOD SECURITY SUMMARY ---\n");
+            sb.append("Risk: ")
+                .append(details.methodRisk().level().displayName())
+                .append(" (")
+                .append(details.methodRisk().score())
+                .append(")\n");
+            sb.append("Auth context differs: ")
+                .append(details.authContextBehaviorDiffers() ? "yes" : "no")
+                .append("\n");
+            if (details.authContextSummary() != null && !details.authContextSummary().isBlank()) {
+            sb.append("Auth summary: ").append(details.authContextSummary()).append("\n");
             }
-        }
+        });
+
+        suggestionService.snapshotExecutionFinding(suggestion.suggestionId()).ifPresent(execution -> {
+            sb.append("\n--- ACTIVE VALIDATION ---\n");
+            sb.append("Confirmed: ").append(execution.confirmed()).append("\n");
+            sb.append("Severity: ").append(execution.severity().displayName()).append("\n");
+            sb.append("Category: ").append(execution.category()).append("\n");
+            sb.append("Response classification: ").append(execution.responseClassification()).append("\n");
+            sb.append("Summary: ").append(execution.summary()).append("\n");
+            sb.append("Exploit chain: ").append(execution.exploitChain()).append("\n");
+            sb.append("Executed at: ").append(execution.executedAt()).append("\n");
+        });
 
         return sb.toString();
+    }
+
+    private static String buildDiffHtml(String adminResponse, String lowPrivResponse) {
+        String admin = adminResponse == null ? "" : adminResponse;
+        String low = lowPrivResponse == null ? "" : lowPrivResponse;
+
+        String[] adminLines = admin.split("\\R", -1);
+        String[] lowLines = low.split("\\R", -1);
+        int max = Math.max(adminLines.length, lowLines.length);
+
+        StringBuilder html = new StringBuilder();
+        html.append("<html><body style='font-family:Consolas,monospace;font-size:12px;'>");
+        html.append("<b>ADMIN vs LOW_PRIV</b><br/>");
+        html.append("<table style='border-collapse:collapse;width:100%;' border='1' cellspacing='0' cellpadding='4'>");
+        html.append("<tr style='background:#f2f2f2;'><th align='left' style='width:70px;'>Line</th><th align='left'>ADMIN</th><th align='left'>LOW_PRIV</th></tr>");
+
+        for (int i = 0; i < max; i++) {
+            String left = i < adminLines.length ? adminLines[i] : "";
+            String right = i < lowLines.length ? lowLines[i] : "";
+            boolean changed = !Objects.equals(left, right);
+
+            String rowStyle = changed ? " style='background:#fffbe6;'" : "";
+            String leftStyle = changed ? " style='background:#ffeaea;'" : "";
+            String rightStyle = changed ? " style='background:#eaffea;'" : "";
+
+            html.append("<tr").append(rowStyle).append(">");
+            html.append("<td>").append(i + 1).append("</td>");
+            html.append("<td").append(leftStyle).append("><pre style='margin:0;white-space:pre-wrap;'>")
+                    .append(escapeHtml(left))
+                    .append("</pre></td>");
+            html.append("<td").append(rightStyle).append("><pre style='margin:0;white-space:pre-wrap;'>")
+                    .append(escapeHtml(right))
+                    .append("</pre></td>");
+            html.append("</tr>");
+        }
+
+        html.append("</table><br/>");
+        html.append("<pre style='white-space:pre-wrap;'>")
+                .append(escapeHtml(TextDiffUtil.summarizeDifferences(admin, low, "ADMIN vs LOW_PRIV")))
+                .append("</pre>");
+        html.append("</body></html>");
+        return html.toString();
     }
 
     private String buildChainsText(AttackSuggestion suggestion) {
@@ -394,7 +504,7 @@ public final class AttackPlannerTab extends JPanel {
             JOptionPane.showMessageDialog(this, "Select a suggestion first.", "No selection", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        String payload = selected.exploitPayload();
+        String payload = selected.effectivePayload();
         copyToClipboard(payload);
         JOptionPane.showMessageDialog(this, "Full payload copied to clipboard!", "Copied", JOptionPane.INFORMATION_MESSAGE);
     }
@@ -416,26 +526,24 @@ public final class AttackPlannerTab extends JPanel {
         AuthContextStore.AuthContext admin = authContextStore.firstContextByRole(RoleType.ADMIN);
 
         if (lowPriv != null) {
-            sb.append("=== LOW_PRIV Headers ===\n");
-            sb.append("Content-Type: application/json\n");
-            if (!lowPriv.rawCookieHeader().isBlank()) sb.append("Cookie: ").append(lowPriv.rawCookieHeader()).append("\n");
-            if (!lowPriv.rawAuthorizationHeader().isBlank()) sb.append("Authorization: ").append(lowPriv.rawAuthorizationHeader()).append("\n");
+            sb.append("=== LOW_PRIV credentials ===\n");
+            sb.append("{\"database\":\"").append(lowPriv.database()).append("\",\"sessionId\":\"")
+                    .append(lowPriv.sessionId()).append("\",\"userName\":\"").append(lowPriv.userName()).append("\"}\n");
             sb.append("\n");
         }
         if (admin != null) {
-            sb.append("=== ADMIN Headers ===\n");
-            sb.append("Content-Type: application/json\n");
-            if (!admin.rawCookieHeader().isBlank()) sb.append("Cookie: ").append(admin.rawCookieHeader()).append("\n");
-            if (!admin.rawAuthorizationHeader().isBlank()) sb.append("Authorization: ").append(admin.rawAuthorizationHeader()).append("\n");
+            sb.append("=== ADMIN credentials ===\n");
+            sb.append("{\"database\":\"").append(admin.database()).append("\",\"sessionId\":\"")
+                    .append(admin.sessionId()).append("\",\"userName\":\"").append(admin.userName()).append("\"}\n");
         }
 
         if (sb.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "No auth sessions captured yet. Browse the target and mark roles in the Dashboard tab.", "No headers", JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, "No sessions captured yet. Browse the target and mark roles in the Dashboard tab.", "No credentials", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
 
         copyToClipboard(sb.toString());
-        JOptionPane.showMessageDialog(this, "Auth headers copied to clipboard!", "Copied", JOptionPane.INFORMATION_MESSAGE);
+        JOptionPane.showMessageDialog(this, "Credentials copied to clipboard!", "Copied", JOptionPane.INFORMATION_MESSAGE);
     }
 
     private void copyHttpRequestToClipboard() {
@@ -449,6 +557,68 @@ public final class AttackPlannerTab extends JPanel {
         JOptionPane.showMessageDialog(this, "Raw HTTP request copied to clipboard!", "Copied", JOptionPane.INFORMATION_MESSAGE);
     }
 
+    private void executeSelectedValidation() {
+        AttackSuggestion selected = getSelectedSuggestion();
+        if (selected == null) {
+            JOptionPane.showMessageDialog(this, "Select a suggestion first.", "No selection", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        if (!suggestionService.hasAttackExecutionService()) {
+            JOptionPane.showMessageDialog(this, "Attack execution service is unavailable.", "Unavailable", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        safeModeToggle.setEnabled(false);
+        try {
+            Optional<AttackExecutionFinding> result = suggestionService.executeSuggestionValidation(selected.suggestionId());
+            refreshNow();
+
+            if (result.isEmpty()) {
+                JOptionPane.showMessageDialog(this, "No execution result returned.", "Active Validation", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+
+            AttackExecutionFinding finding = result.get();
+            JOptionPane.showMessageDialog(
+                    this,
+                    "Validation complete.\n\n"
+                            + "Confirmed: " + finding.confirmed() + "\n"
+                            + "Severity: " + finding.severity().displayName() + "\n"
+                            + "Category: " + finding.category() + "\n"
+                            + "Response: " + finding.responseClassification(),
+                    "Active Validation",
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+        } finally {
+            safeModeToggle.setEnabled(suggestionService.hasAttackExecutionService());
+        }
+    }
+
+    private void executeTopValidations() {
+        if (!suggestionService.hasAttackExecutionService()) {
+            JOptionPane.showMessageDialog(this, "Attack execution service is unavailable.", "Unavailable", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        safeModeToggle.setEnabled(false);
+        try {
+            List<AttackExecutionFinding> findings = suggestionService.executeTopSuggestionValidations(5);
+            refreshNow();
+
+            long confirmed = findings.stream().filter(AttackExecutionFinding::confirmed).count();
+            JOptionPane.showMessageDialog(
+                    this,
+                    "Validated suggestions: " + findings.size() + "\n"
+                            + "Confirmed findings: " + confirmed + "\n"
+                            + "Safe Mode: " + (suggestionService.isAttackSafeMode() ? "ON" : "OFF"),
+                    "Batch Validation",
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+        } finally {
+            safeModeToggle.setEnabled(suggestionService.hasAttackExecutionService());
+        }
+    }
+
     private void sendToRepeater() {
         AttackSuggestion selected = getSelectedSuggestion();
         if (selected == null) {
@@ -459,11 +629,7 @@ public final class AttackPlannerTab extends JPanel {
         try {
             String rawHttp = selected.repeaterRequest();
             if (rawHttp == null || rawHttp.isBlank()) {
-                rawHttp = selected.exploitPayload();
-            }
-            if (rawHttp == null || rawHttp.isBlank()) {
-                JOptionPane.showMessageDialog(this, "No repeater-ready request available for this suggestion.", "No request", JOptionPane.INFORMATION_MESSAGE);
-                return;
+                rawHttp = CopyablePayloadBuilder.buildHttpRequest(selected, authContextStore, index);
             }
 
             String normalizedRaw = rawHttp.contains("\\r\\n") && !rawHttp.contains("\r\n")
@@ -501,7 +667,7 @@ public final class AttackPlannerTab extends JPanel {
             api.repeater().sendToRepeater(httpRequest, tabName);
 
             byte[] sentBytes = normalizedRaw.getBytes(StandardCharsets.UTF_8);
-            api.logging().logToOutput("[MyGeotab][repeater-bytes] suggestionId=" + selected.suggestionId()
+                api.logging().logToOutput("[LogicHunter][repeater-bytes] suggestionId=" + selected.suggestionId()
                     + " host=" + host
                     + " bytes=" + sentBytes.length
                     + " base64=" + Base64.getEncoder().encodeToString(sentBytes));
@@ -574,8 +740,6 @@ public final class AttackPlannerTab extends JPanel {
                 adminNode.put("database", adminCtx.database());
                 adminNode.put("userName", adminCtx.userName());
                 adminNode.put("sessionId", adminCtx.sessionId());
-                adminNode.put("authorization", adminCtx.rawAuthorizationHeader());
-                adminNode.put("cookie", adminCtx.rawCookieHeader());
                 adminNode.put("lastUrl", adminCtx.lastSeenUrl());
                 payload.set("adminContext", adminNode);
             }
@@ -584,8 +748,6 @@ public final class AttackPlannerTab extends JPanel {
                 lowNode.put("database", lowPrivCtx.database());
                 lowNode.put("userName", lowPrivCtx.userName());
                 lowNode.put("sessionId", lowPrivCtx.sessionId());
-                lowNode.put("authorization", lowPrivCtx.rawAuthorizationHeader());
-                lowNode.put("cookie", lowPrivCtx.rawCookieHeader());
                 lowNode.put("lastUrl", lowPrivCtx.lastSeenUrl());
                 payload.set("lowPrivContext", lowNode);
             }
@@ -642,6 +804,18 @@ public final class AttackPlannerTab extends JPanel {
     private static String truncateForDisplay(String value, int maxLen) {
         if (value == null) return "(empty)";
         return value.length() <= maxLen ? value : value.substring(0, maxLen) + "\n... (truncated)";
+    }
+
+    private static String escapeHtml(String value) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        return value
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;");
     }
 
     private static JTextArea buildMonoTextArea() {

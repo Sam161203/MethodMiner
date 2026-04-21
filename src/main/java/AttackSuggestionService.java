@@ -1,16 +1,12 @@
 import burp.api.montoya.logging.Logging;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.time.Instant;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -27,18 +23,16 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class AttackSuggestionService implements AutoCloseable {
-    private static final int MAX_SUGGESTIONS = 220;
-    private static final int MIN_STRONG_SIGNALS_FOR_SUGGESTION = 2;
-    private static final int MAX_OBSERVED_ITEMS = 6_000;
+    private static final String DEFAULT_TARGET_HOST = "example.com";
+    private static final String DEFAULT_TARGET_PATH = "/jsonrpc";
 
     private static final Set<String> SUPPRESSED_METHOD_TERMS = Set.of(
-            "jsonp", "cors", "addin", "add-in", "addins", "message", "messages", "audit", "auditlog",
-            "password", "dos", "rate", "ratelimit", "ui-only", "uionly"
+            "jsonp", "cors", "addin", "add-in", "addins", "message", "messages",
+            "audit", "audit-log", "auditlog", "ui-only", "uionly",
+            "password", "password-complexity", "dos"
     );
 
-    private static final Set<String> TENANT_KEYS = Set.of(
-            "tenant", "database", "db", "group", "groupid", "groupcompanyid", "company", "organization", "org"
-    );
+    private static final int MAX_SUGGESTIONS = 400;
 
     private final ObjectMapper objectMapper;
     private final JsonRpcIndex index;
@@ -55,12 +49,12 @@ public final class AttackSuggestionService implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicBoolean recomputeQueued = new AtomicBoolean(false);
 
-    private final Map<String, ObservedItem> observedItems = new ConcurrentHashMap<>();
-    private final ArrayDeque<String> observedOrder = new ArrayDeque<>();
-    private final Object observedOrderLock = new Object();
+    private final Map<String, RequestObservation> observations = new ConcurrentHashMap<>();
 
     private volatile List<AttackSuggestion> latestSuggestions = List.of();
     private volatile Map<String, AttackSuggestion> suggestionsById = Map.of();
+    private volatile Map<String, AttackExecutionFinding> executionFindingsBySuggestionId = Map.of();
+    private volatile AttackExecutionService attackExecutionService;
 
     public AttackSuggestionService(
             ObjectMapper objectMapper,
@@ -82,6 +76,7 @@ public final class AttackSuggestionService implements AutoCloseable {
         this.securityAnalyzer.registerUpdateListener(this::requestRecomputeAsync);
         this.workflowGraphService.registerUpdateListener(this::requestRecomputeAsync);
         this.entityStoreService.registerUpdateListener(this::requestRecomputeAsync);
+        this.authContextStore.registerUpdateListener(this::requestRecomputeAsync);
     }
 
     public void registerUpdateListener(Runnable listener) {
@@ -117,83 +112,38 @@ public final class AttackSuggestionService implements AutoCloseable {
     void recomputeSync() {
         Map<String, AttackSuggestion> deduplicated = new LinkedHashMap<>();
 
-        List<ObservedItem> snapshot = new ArrayList<>(observedItems.values());
-        snapshot.sort(Comparator.comparing(ObservedItem::timestamp));
+        List<RequestObservation> snapshot = new ArrayList<>(observations.values());
+        snapshot.sort(Comparator.comparing(RequestObservation::timestamp));
 
-        Map<String, List<ObservedItem>> grouped = new LinkedHashMap<>();
-        for (ObservedItem item : snapshot) {
-            if (!MyGeotabScope.isAllowedHost(item.host())) {
-                continue;
-            }
-            if (isSuppressedMethod(item.methodName())) {
-                continue;
-            }
-            String groupKey = item.methodName() + "|" + defaultIfBlank(item.typeName(), "none");
-            grouped.computeIfAbsent(groupKey, ignored -> new ArrayList<>()).add(item);
+        Map<String, AuthContextStore.SessionView> contextsByKey = new HashMap<>();
+        for (AuthContextStore.SessionView session : authContextStore.snapshotSessions()) {
+            contextsByKey.put(session.contextKey(), session);
         }
 
-        Map<String, Integer> methodRiskScores = new HashMap<>();
-        for (SecurityFinding finding : securityAnalyzer.snapshotFindings()) {
-            methodRiskScores.merge(finding.method(), finding.riskScore(), Math::max);
+        Map<String, EntityStoreService.ExtractedEntity> entitiesById = new HashMap<>();
+        for (EntityStoreService.ExtractedEntity entity : entityStoreService.snapshotExtractedEntities()) {
+            entitiesById.put(entity.entityId(), entity);
         }
 
+        List<JsonRpcIndex.MethodStoreView> methodStore = index.snapshotMethodStoreViews();
+        Map<String, Set<String>> methodToContexts = buildMethodContextMap(methodStore);
+        Map<String, List<MethodDiffEvidence>> methodDiffEvidence = buildMethodDiffEvidence(methodStore, contextsByKey);
+        Map<String, Set<String>> entityToContexts = buildEntityContextMap(entitiesById);
         WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot = workflowGraphService.snapshot();
-        Map<String, Integer> chainEdgeCounts = buildChainEdgeCounts(workflowSnapshot);
-        Map<String, Integer> chainCounts = buildChainCounts(workflowSnapshot);
-        Map<String, String> preferredChains = buildPreferredChainPaths(workflowSnapshot);
 
-        for (Map.Entry<String, List<ObservedItem>> entry : grouped.entrySet()) {
-            List<ObservedItem> items = entry.getValue();
-            if (items.isEmpty()) {
-                continue;
-            }
-
-            ContextPair pair = selectContextPair(items);
-            ObservedItem base = pair != null && pair.lowContextItem() != null
-                    ? pair.lowContextItem()
-                    : items.get(items.size() - 1);
-            ObservedItem high = pair != null ? pair.highContextItem() : null;
-
-                MethodContext reclassifiedContext = reclassifyMethodContext(
-                    items,
-                    methodRiskScores.getOrDefault(base.methodName(), 0),
-                    pair
-                );
-
-                EntitySwapTarget swapTarget = selectEntitySwapTarget(items, high, base);
-                String preferredChainPath = preferredChains.getOrDefault(base.methodName(), base.methodName());
-
-                SignalSet signals = buildSignals(
-                    items,
-                    pair,
-                    methodRiskScores.getOrDefault(base.methodName(), 0),
-                    chainEdgeCounts.getOrDefault(base.methodName(), 0),
-                    chainCounts.getOrDefault(base.methodName(), 0),
-                    reclassifiedContext,
-                    !preferredChainPath.equals(base.methodName())
-                );
-
-                if (!signals.provenSignal()) {
-                continue;
-                }
-
-                emitCrossTenantSuggestion(deduplicated, base, swapTarget, signals, reclassifiedContext, preferredChainPath, pair);
-                emitCredentialSwapSuggestions(deduplicated, base, high, signals, reclassifiedContext, preferredChainPath, pair);
-                emitLowPrivReplaySuggestion(deduplicated, base, signals, reclassifiedContext, preferredChainPath);
-                emitAuthDifferentialSuggestion(deduplicated, base, high, pair, signals, reclassifiedContext, preferredChainPath);
-                emitBatchAuthorizationSuggestion(deduplicated, base, swapTarget, signals, reclassifiedContext, preferredChainPath);
-                emitNotificationSuggestion(deduplicated, base, signals, reclassifiedContext, preferredChainPath);
-                emitParamEncodingSuggestion(deduplicated, base, signals, reclassifiedContext, preferredChainPath);
-                emitNestedParamIntegritySuggestion(deduplicated, base, signals, reclassifiedContext, preferredChainPath);
-                emitEntityReplaySuggestion(deduplicated, base, swapTarget, signals, reclassifiedContext, preferredChainPath, pair);
-        }
+        runPrivilegeDiffDetector(methodDiffEvidence, contextsByKey, entitiesById, workflowSnapshot, deduplicated);
+        runBolaDetector(snapshot, entitiesById, contextsByKey, methodStore, methodDiffEvidence, entityToContexts, workflowSnapshot, deduplicated);
+        runMulticallDetector(snapshot, contextsByKey, methodStore, methodDiffEvidence, entityToContexts, methodToContexts, workflowSnapshot, deduplicated);
+        runCrossTenantDetector(snapshot, entitiesById, contextsByKey, methodStore, methodDiffEvidence, entityToContexts, workflowSnapshot, deduplicated);
+        runSearchEnumerationDetector(snapshot, contextsByKey, methodStore, methodToContexts, workflowSnapshot, deduplicated);
+        runMethodAccessDetector(methodStore, contextsByKey, workflowSnapshot, deduplicated);
 
         List<AttackSuggestion> next = new ArrayList<>(deduplicated.values());
         next.sort(Comparator
                 .comparingInt(AttackSuggestion::priorityScore).reversed()
-                .thenComparingInt(AttackSuggestion::confidenceScore).reversed()
-                .thenComparing(AttackSuggestion::category, String.CASE_INSENSITIVE_ORDER)
-                .thenComparing(AttackSuggestion::findingTitle, String.CASE_INSENSITIVE_ORDER));
+                .thenComparing(AttackSuggestion::findingType, String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(AttackSuggestion::method, String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(AttackSuggestion::entityId, String.CASE_INSENSITIVE_ORDER));
 
         if (next.size() > MAX_SUGGESTIONS) {
             next = new ArrayList<>(next.subList(0, MAX_SUGGESTIONS));
@@ -206,7 +156,7 @@ public final class AttackSuggestionService implements AutoCloseable {
 
         latestSuggestions = List.copyOf(next);
         suggestionsById = Map.copyOf(byId);
-        logging.logToOutput("[LogicHunter][SUGGEST] grouped=" + grouped.size() + " generated=" + next.size());
+        logging.logToOutput("[LogicHunter][SUGGEST] observations=" + snapshot.size() + " generated=" + next.size());
         notifyListeners();
     }
 
@@ -218,6 +168,85 @@ public final class AttackSuggestionService implements AutoCloseable {
         return Optional.ofNullable(suggestionsById.get(suggestionId));
     }
 
+    public void setAttackExecutionService(AttackExecutionService attackExecutionService) {
+        this.attackExecutionService = attackExecutionService;
+    }
+
+    public Optional<AttackExecutionFinding> executeSuggestionValidation(String suggestionId) {
+        AttackExecutionService executionService = attackExecutionService;
+        if (executionService == null || suggestionId == null || suggestionId.isBlank()) {
+            return Optional.empty();
+        }
+
+        AttackSuggestion suggestion = suggestionsById.get(suggestionId);
+        if (suggestion == null) {
+            return Optional.empty();
+        }
+
+        Optional<AttackExecutionFinding> result = executionService.executeForSuggestion(suggestion);
+        if (result.isEmpty()) {
+            return Optional.empty();
+        }
+
+        Map<String, AttackExecutionFinding> next = new LinkedHashMap<>(executionFindingsBySuggestionId);
+        next.put(suggestionId, result.get());
+        executionFindingsBySuggestionId = Map.copyOf(next);
+        notifyListeners();
+        return result;
+    }
+
+    public Map<String, AttackExecutionFinding> snapshotExecutionFindings() {
+        return executionFindingsBySuggestionId;
+    }
+
+    public Optional<AttackExecutionFinding> snapshotExecutionFinding(String suggestionId) {
+        return Optional.ofNullable(executionFindingsBySuggestionId.get(suggestionId));
+    }
+
+    public boolean hasAttackExecutionService() {
+        return attackExecutionService != null;
+    }
+
+    public boolean isAttackSafeMode() {
+        AttackExecutionService executionService = attackExecutionService;
+        return executionService == null || executionService.isSafeMode();
+    }
+
+    public void setAttackSafeMode(boolean safeMode) {
+        AttackExecutionService executionService = attackExecutionService;
+        if (executionService == null) {
+            return;
+        }
+        executionService.setSafeMode(safeMode);
+    }
+
+    public void setAttackMaxRequestsPerFinding(int maxRequests) {
+        AttackExecutionService executionService = attackExecutionService;
+        if (executionService == null) {
+            return;
+        }
+        executionService.setMaxRequestsPerFinding(maxRequests);
+    }
+
+    public int attackMaxRequestsPerFinding() {
+        AttackExecutionService executionService = attackExecutionService;
+        return executionService == null ? 0 : executionService.maxRequestsPerFinding();
+    }
+
+    public List<AttackExecutionFinding> executeTopSuggestionValidations(int limit) {
+        if (limit <= 0) {
+            return List.of();
+        }
+
+        List<AttackExecutionFinding> out = new ArrayList<>();
+        int max = Math.min(limit, latestSuggestions.size());
+        for (int i = 0; i < max; i++) {
+            AttackSuggestion suggestion = latestSuggestions.get(i);
+            executeSuggestionValidation(suggestion.suggestionId()).ifPresent(out::add);
+        }
+        return List.copyOf(out);
+    }
+
     public ObjectNode buildManualExportBundle(String suggestionId) {
         AttackSuggestion suggestion = snapshotSuggestion(suggestionId)
                 .orElseThrow(() -> new IllegalArgumentException("Unknown suggestion ID: " + suggestionId));
@@ -227,9 +256,10 @@ public final class AttackSuggestionService implements AutoCloseable {
         root.put("mode", "manual-only");
         root.put("suggestionId", suggestion.suggestionId());
         root.put("title", suggestion.findingTitle());
-        root.put("category", suggestion.category());
+        root.put("category", suggestion.findingType());
         root.put("host", suggestion.host());
-        root.put("method", suggestion.primaryMethod());
+        root.put("method", suggestion.method());
+        root.put("typeName", suggestion.typeName());
         root.put("attackPath", suggestion.attackPath());
         root.put("reason", suggestion.whySuspicious());
         root.put("confidenceScore", suggestion.confidenceScore());
@@ -239,17 +269,39 @@ public final class AttackSuggestionService implements AutoCloseable {
         root.put("repeaterRequest", suggestion.repeaterRequest());
         root.put("observation", suggestion.observation());
         root.put("evidence", suggestion.evidence());
+        root.put("sessionId", suggestion.sessionId());
+        root.put("entityId", suggestion.entityId());
+        root.put("adminResponse", suggestion.adminResponse());
+        root.put("lowPrivResponse", suggestion.lowPrivResponse());
+        root.put("payload", suggestion.payload());
+        root.put("curlCommand", buildCurlCommand(suggestion));
+        root.put("bugcrowdMarkdown", suggestion.bugcrowdMarkdown());
         root.put("formattedFinding", suggestion.toFormattedFinding());
 
-        ArrayNode checklist = objectMapper.createArrayNode();
-        checklist.add("Use the exact repeaterRequest bytes without rebuilding headers/body manually.");
-        checklist.add("Replay under LOW_PRIV and compare against ADMIN context behavior.");
-        checklist.add("Record differences in database, sessionId, userName, status, and object ownership fields.");
-        checklist.add("Confirm unauthorized object access/state-change before reporting.");
-        root.set("manualChecklist", checklist);
+        AttackExecutionFinding executionFinding = executionFindingsBySuggestionId.get(suggestionId);
+        if (executionFinding != null) {
+            ObjectNode executionNode = objectMapper.createObjectNode();
+            executionNode.put("findingId", executionFinding.findingId());
+            executionNode.put("category", executionFinding.category());
+            executionNode.put("severity", executionFinding.severity().displayName());
+            executionNode.put("confirmed", executionFinding.confirmed());
+            executionNode.put("method", executionFinding.method());
+            executionNode.put("entityId", executionFinding.entityId());
+            executionNode.put("sourceContext", executionFinding.sourceContext());
+            executionNode.put("targetContext", executionFinding.targetContext());
+            executionNode.put("sourceRole", executionFinding.sourceRole().displayName());
+            executionNode.put("targetRole", executionFinding.targetRole().displayName());
+            executionNode.put("responseClassification", executionFinding.responseClassification());
+            executionNode.put("exploitChain", executionFinding.exploitChain());
+            executionNode.put("summary", executionFinding.summary());
+            executionNode.put("payloadUsed", executionFinding.payloadUsed());
+            executionNode.put("executedAt", executionFinding.executedAt() == null ? "" : executionFinding.executedAt().toString());
+            root.set("attackExecution", executionNode);
+        }
 
-        if (!suggestion.primaryMethod().isBlank() && !"(multiple)".equals(suggestion.primaryMethod())) {
-            index.snapshotMethodDetails(suggestion.primaryMethod())
+        if (!suggestion.method().isBlank()) {
+            String lookupKey = suggestion.method() + ":" + defaultIfBlank(suggestion.typeName(), "Unknown");
+            index.snapshotMethodDetails(lookupKey)
                     .ifPresent(details -> root.set("methodMetadata", details.toMetadataJson(objectMapper)));
         }
 
@@ -257,12 +309,10 @@ public final class AttackSuggestionService implements AutoCloseable {
     }
 
     public void clear() {
-        synchronized (observedOrderLock) {
-            observedItems.clear();
-            observedOrder.clear();
-        }
+        observations.clear();
         latestSuggestions = List.of();
         suggestionsById = Map.of();
+        executionFindingsBySuggestionId = Map.of();
         notifyListeners();
     }
 
@@ -293,1021 +343,1483 @@ public final class AttackSuggestionService implements AutoCloseable {
             return;
         }
 
-        List<CallView> calls = parseCallViews(rawRecord.request().bodyText());
-        if (calls.isEmpty()) {
-            calls = List.of(new CallView(
-                    0,
-                    normalizedRecord.methodName(),
-                    normalizedRecord.typeName(),
-                    normalizedRecord.rpcVersion(),
-                    normalizedRecord.batchRequest(),
-                    normalizedRecord.notificationRequest(),
-                    normalizedRecord.paramsMode(),
-                    normalizedRecord.nestedMethods(),
-                    objectMapper.createObjectNode(),
-                    objectMapper.createObjectNode()
-            ));
+        if (isSuppressedMethod(normalizedRecord.methodName())) {
+            return;
         }
 
-        JsonNode responseNode = parseJson(rawRecord.response().bodyText());
-        ResponseSnapshot responseSnapshot = summarizeResponse(rawRecord.response().statusCode(), responseNode, rawRecord.response().bodyText());
-
-        for (CallView call : calls) {
-            AuthContextStore.AuthContext auth = authContextStore.observeRecord(rawRecord, call.methodName());
-            RoleType role = authContextStore.roleForContextKey(auth.contextKey());
-
-            TenantSnapshot tenant = buildTenantSnapshot(call.paramsNode(), responseNode, auth);
-            EntitySnapshot entity = buildEntitySnapshot(call.paramsNode(), responseNode, auth);
-            MethodClassification classification = classifyMethod(call, responseSnapshot, tenant, entity);
-
-            RpcContext rpcContext = new RpcContext(
-                    call.rpcVersion(),
-                    call.batchRequest(),
-                    call.notificationRequest(),
-                    call.paramsMode(),
-                    call.nestedMethods(),
-                    call.callIndex()
-            );
-
-            MethodContext methodContext = new MethodContext(
-                    classification.mode(),
-                    classification.adminSensitive(),
-                    classification.wrapper(),
-                    classification.notificationCapable(),
-                    classification.metaTelemetry(),
-                    call.typeName()
-            );
-
-            AuthSnapshot authSnapshot = new AuthSnapshot(
-                    auth.contextKey(),
-                    safe(auth.database()),
-                    safe(auth.sessionId()),
-                    safe(auth.userName()),
-                    role
-            );
-
-            ObservedItem item = new ObservedItem(
-                    rawRecord.recordId() + "#" + call.callIndex(),
-                    rawRecord.recordId(),
-                    rawRecord.timestamp(),
-                    host,
-                    call.methodName(),
-                    safe(call.typeName()),
-                    call.callIndex(),
-                    rawRecord.request().rawHttpText(),
-                    rawRecord.response().rawHttpText(),
-                    rpcContext,
-                    authSnapshot,
-                    tenant,
-                    methodContext,
-                    entity,
-                    responseSnapshot
-            );
-
-            rememberObservedItem(item);
-            logObservation(item);
+        AuthContextStore.Credentials credentials = authContextStore.extractCredentials(rawRecord.request().bodyText());
+        if (credentials == null) {
+            return;
         }
+
+        AuthContextStore.AuthContext observedContext = authContextStore.lookupContext(rawRecord.request().bodyText(), rawRecord.request().url());
+
+        ParsedRequest parsed = parseRequest(rawRecord.request().bodyText(), normalizedRecord);
+        if (parsed == null) {
+            return;
+        }
+
+        String observationId = defaultIfBlank(rawRecord.recordId(), "record")
+                + "|" + normalizedRecord.methodName()
+                + "|" + defaultIfBlank(normalizedRecord.typeName(), parsed.typeName());
+
+        RequestObservation observation = new RequestObservation(
+                observationId,
+                rawRecord.recordId(),
+                rawRecord.timestamp() == null ? Instant.now() : rawRecord.timestamp(),
+                host,
+            normalizedRecord.methodName(),
+            defaultIfBlank(parsed.wrapperMethod(), normalizedRecord.methodName()),
+                defaultIfBlank(parsed.typeName(), normalizedRecord.typeName()),
+            defaultIfBlank(observedContext.contextKey(), ""),
+            defaultIfBlank(observedContext.sessionId(), credentials.sessionId()),
+            defaultIfBlank(observedContext.database(), defaultIfBlank(credentials.database(), "unknown-db")),
+            defaultIfBlank(observedContext.userName(), defaultIfBlank(credentials.userName(), "unknown-user")),
+                parsed.entityIds(),
+                parsed.multiCall(),
+                parsed.emptySearchInSubCall(),
+                parsed.subCallTypeNames(),
+            parsed.subCallMethods(),
+            parsed.hasWriteSubCall(),
+            parsed.hasMixedPrivilegeChain(),
+                normalizedRecord.paramsMode(),
+                parsed.notification(),
+                rawRecord.request().bodyText() == null ? "" : rawRecord.request().bodyText(),
+                rawRecord.response().bodyText() == null ? "" : rawRecord.response().bodyText(),
+                rawRecord.response().statusCode(),
+                parsed.broadSearch()
+        );
+
+        observations.put(observationId, observation);
     }
 
-    private void rememberObservedItem(ObservedItem item) {
-        synchronized (observedOrderLock) {
-            if (!observedItems.containsKey(item.observationId())) {
-                observedOrder.addLast(item.observationId());
+    private ParsedRequest parseRequest(String requestBody, JsonRpcNormalizedRecord normalizedRecord) {
+        JsonNode root = parseJson(requestBody);
+        if (root == null) {
+            return null;
+        }
+
+        JsonNode call = root;
+        if (root.isArray() && root.size() > 0 && root.get(0).isObject()) {
+            call = root.get(0);
+        }
+
+        if (call == null || !call.isObject()) {
+            return null;
+        }
+
+        JsonNode params = call.get("params");
+        if (params == null || params.isNull()) {
+            return null;
+        }
+
+        String wrapperMethod = asText(call.get("method"));
+        String typeName = "";
+        if (params.isObject()) {
+            typeName = asText(params.get("typeName"));
+        }
+        if (typeName.isBlank()) {
+            typeName = normalizedRecord.typeName();
+        }
+
+        LinkedHashSet<String> entityIds = new LinkedHashSet<>();
+        collectEntityIdsFromParams(params, "", entityIds, 0);
+
+        boolean multiCall = wrapperMethod.toLowerCase(Locale.ROOT).contains("multicall") || normalizedRecord.batchRequest();
+        boolean emptySearchInSubCall = false;
+        LinkedHashSet<String> subTypeNames = new LinkedHashSet<>();
+        LinkedHashSet<String> subCallMethods = new LinkedHashSet<>();
+        boolean hasWriteSubCall = false;
+        boolean hasMixedPrivilegeChain = false;
+        if (multiCall && params.isObject()) {
+            MultiCallInfo info = parseMultiCallInfo(params);
+            emptySearchInSubCall = info.emptySearchInSubCall();
+            subTypeNames.addAll(info.subCallTypeNames());
+            subCallMethods.addAll(info.subCallMethods());
+            hasWriteSubCall = info.hasWriteSubCall();
+            hasMixedPrivilegeChain = info.hasMixedPrivilegeChain();
+        }
+
+        // Detect standalone broad/unrestricted search patterns
+        boolean broadSearch = false;
+        if (!multiCall && params.isObject()) {
+            String methodLower = wrapperMethod.toLowerCase(Locale.ROOT);
+            boolean isReadMethod = methodLower.startsWith("get") || methodLower.startsWith("find")
+                    || methodLower.startsWith("list") || methodLower.startsWith("search");
+            if (isReadMethod) {
+                JsonNode searchNode = params.get("search");
+                if (searchNode == null || searchNode.isMissingNode()) {
+                    broadSearch = true; // No search clause at all
+                } else if (searchNode.isObject()) {
+                    if (searchNode.size() == 0) {
+                        broadSearch = true; // Empty search: {}
+                    } else {
+                        boolean hasIdConstraint = false;
+                        java.util.Iterator<String> fieldNames = searchNode.fieldNames();
+                        while (fieldNames.hasNext()) {
+                            String field = fieldNames.next().toLowerCase(Locale.ROOT);
+                            if (isEntityKey(field)) {
+                                hasIdConstraint = true;
+                                break;
+                            }
+                        }
+                        if (!hasIdConstraint) {
+                            broadSearch = true; // Search has no ID constraint (e.g. {isDeviceCommunicating:true})
+                        }
+                    }
+                }
             }
-            observedItems.put(item.observationId(), item);
+        }
 
-            while (observedOrder.size() > MAX_OBSERVED_ITEMS) {
-                String evictedId = observedOrder.removeFirst();
-                observedItems.remove(evictedId);
+        boolean notification = !call.has("id") || call.path("id").isNull();
+
+        return new ParsedRequest(
+                wrapperMethod,
+                typeName,
+                List.copyOf(entityIds),
+                multiCall,
+                emptySearchInSubCall,
+                List.copyOf(subTypeNames),
+                List.copyOf(subCallMethods),
+                hasWriteSubCall,
+                hasMixedPrivilegeChain,
+                notification,
+                broadSearch
+        );
+    }
+
+    private void collectEntityIdsFromParams(JsonNode node, String keyName, Set<String> out, int depth) {
+        if (node == null || node.isNull() || node.isMissingNode() || depth > 8) {
+            return;
+        }
+
+        if (node.isObject()) {
+            node.fields().forEachRemaining(entry -> {
+                String key = entry.getKey() == null ? "" : entry.getKey();
+                if ("credentials".equalsIgnoreCase(key)) {
+                    return;
+                }
+                collectEntityIdsFromParams(entry.getValue(), key, out, depth + 1);
+            });
+            return;
+        }
+
+        if (node.isArray()) {
+            for (JsonNode child : node) {
+                collectEntityIdsFromParams(child, keyName, out, depth + 1);
+            }
+            return;
+        }
+
+        if (!node.isValueNode()) {
+            return;
+        }
+
+        String lowered = keyName.toLowerCase(Locale.ROOT);
+        if (!isEntityKey(lowered)) {
+            return;
+        }
+
+        String value = asText(node);
+        if (!value.isBlank()) {
+            out.add(value);
+        }
+    }
+
+    private MultiCallInfo parseMultiCallInfo(JsonNode params) {
+        LinkedHashSet<String> subTypeNames = new LinkedHashSet<>();
+        LinkedHashSet<String> subCallMethods = new LinkedHashSet<>();
+        boolean emptySearch = false;
+        boolean hasWrite = false;
+        boolean hasRead = false;
+
+        JsonNode calls = params.path("calls");
+        if (!calls.isArray()) {
+            calls = params.path("requests");
+        }
+        if (!calls.isArray()) {
+            calls = params.path("operations");
+        }
+
+        if (calls.isArray()) {
+            for (JsonNode subCall : calls) {
+                JsonNode subParams = subCall.path("params");
+                JsonNode subSearch = subParams.path("search");
+                if (subSearch.isObject() && subSearch.size() == 0) {
+                    emptySearch = true;
+                }
+
+                String subMethod = asText(subCall.get("method"));
+                if (!subMethod.isBlank()) {
+                    subCallMethods.add(subMethod);
+                    if (isWriteLikeMethod(subMethod)) {
+                        hasWrite = true;
+                    } else {
+                        hasRead = true;
+                    }
+                }
+
+                String subType = asText(subParams.get("typeName"));
+                if (!subType.isBlank()) {
+                    subTypeNames.add(subType);
+                }
+            }
+        }
+
+        return new MultiCallInfo(
+                emptySearch,
+                List.copyOf(subTypeNames),
+                List.copyOf(subCallMethods),
+                hasWrite,
+                hasWrite && hasRead
+        );
+    }
+
+    private void runBolaDetector(
+            List<RequestObservation> observations,
+            Map<String, EntityStoreService.ExtractedEntity> entitiesById,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, List<MethodDiffEvidence>> methodDiffEvidence,
+            Map<String, Set<String>> entityToContexts,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot,
+            Map<String, AttackSuggestion> out
+    ) {
+        for (RequestObservation observation : observations) {
+            if (isSuppressedMethod(observation.method()) || observation.requestEntityIds().isEmpty()) {
+                continue;
+            }
+
+            String targetContext = defaultIfBlank(observation.contextKey(), "");
+            if (targetContext.isBlank()) {
+                continue;
+            }
+
+            RoleType targetRole = roleFor(targetContext, contextsByKey);
+
+            for (String entityId : observation.requestEntityIds()) {
+                EntityStoreService.ExtractedEntity entity = entitiesById.get(entityId);
+                if (entity == null) {
+                    continue;
+                }
+
+                Set<String> seenContexts = new LinkedHashSet<>(entityToContexts.getOrDefault(entityId, Set.of()));
+                seenContexts.add(targetContext);
+                if (seenContexts.size() < 2) {
+                    continue;
+                }
+
+                String sourceContext = pickSourceContext(seenContexts, targetContext, contextsByKey);
+                if (sourceContext.isBlank()) {
+                    continue;
+                }
+
+                RoleType sourceRole = roleFor(sourceContext, contextsByKey);
+                String sourceResponse = findResponseForContext(methodStore, sourceContext, observation.method(), observation.typeName());
+                String targetResponse = defaultIfBlank(observation.responseBody(), "");
+                String sourceResponseClass = classifyResponse(sourceResponse);
+                String targetResponseClass = classifyResponse(targetResponse);
+
+                String methodKey = buildMethodKey(observation.method(), observation.typeName());
+                String observedDifference = findMethodDifference(
+                        methodDiffEvidence,
+                        methodKey,
+                        sourceContext,
+                        targetContext,
+                        sourceResponse,
+                        targetResponse
+                );
+
+                if (observedDifference.isBlank() && !(targetRole == RoleType.LOW_PRIV && sourceRole == RoleType.ADMIN)) {
+                    continue;
+                }
+
+                if (observedDifference.isBlank()) {
+                    observedDifference = "Method " + observation.method() + ":" + observation.typeName()
+                            + " reuses entity '" + entityId + "' across contexts " + seenContexts
+                            + "; sourceRole=" + sourceRole.displayName() + " sourceResponse=" + sourceResponseClass
+                            + "; targetRole=" + targetRole.displayName() + " targetResponse=" + targetResponseClass + ".";
+                }
+
+                String confidence = confidenceFor(targetContext, sourceContext, contextsByKey);
+                if ("LOW".equals(confidence)) {
+                    continue;
+                }
+
+                String exactAttackAction = "Replay " + observation.method() + ":" + observation.typeName()
+                        + " while authenticated as target context " + targetContext
+                        + " and inject entityId='" + entityId + "' captured from source context " + sourceContext + ".";
+                String exploitChain = buildExploitChain(observation, sourceContext, targetContext, entityId, workflowSnapshot);
+                if (!exploitChain.isBlank()) {
+                    exactAttackAction = exactAttackAction + " " + exploitChain;
+                }
+
+                String payload = buildPayloadHttp(observation, entityId);
+                String curl = buildCurlCommand(payload);
+
+                AttackSuggestion finding = buildFinding(
+                        "BOLA_IDOR",
+                        "Authorization / BOLA-IDOR",
+                        confidence,
+                        observation,
+                        sourceContext,
+                        targetContext,
+                        entityId,
+                        observedDifference,
+                        exactAttackAction,
+                        sourceResponse,
+                        targetResponse,
+                        payload,
+                        curl,
+                        "Unauthorized object access and ownership bypass through cross-context identifier replay.",
+                        "BOLA/IDOR replay"
+                );
+                putFinding(out, finding);
             }
         }
     }
 
-    private void emitCrossTenantSuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            EntitySwapTarget swapTarget,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath,
-            ContextPair pair
+    private void runPrivilegeDiffDetector(
+            Map<String, List<MethodDiffEvidence>> methodDiffEvidence,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            Map<String, EntityStoreService.ExtractedEntity> entitiesById,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot,
+            Map<String, AttackSuggestion> out
     ) {
-        if (!swapTarget.present()) {
-            return;
-        }
-        // Relax: allow cross-tenant suggestions when tenantReplayable even without chain evidence
-        if (!signals.chainConnected() && !signals.tenantReplayable()) {
-            return;
-        }
-        if (!signals.tenantReplayable() && !signals.idsReusedAcrossContexts() && !signals.authDifferenceDetected()) {
-            return;
-        }
+        for (Map.Entry<String, List<MethodDiffEvidence>> entry : methodDiffEvidence.entrySet()) {
+            String methodKey = entry.getKey();
+            String method = methodFromKey(methodKey);
+            String typeName = typeFromKey(methodKey);
 
-        String mutated = mutateUsingSwapTarget(base, swapTarget);
-        if (mutated.equals(base.httpRequestRaw())) {
-            return;
-        }
+            for (MethodDiffEvidence evidence : entry.getValue()) {
+                if (evidence.sourceContext().equals(evidence.targetContext())) {
+                    continue;
+                }
 
-        createAndPut(
-                deduplicated,
-                base,
-                swapTarget.newValue(),
-                "Cross-Tenant / Cross-Database Access",
-                "Cross-tenant ID swap on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "id swap:" + swapTarget.fieldKey()),
-                reasonFor("Entity ID from a different context is replayed in the same request shape.", signals),
-                "Mutates one captured field using a real value seen in another tenant/account context.",
-                "Server should reject the request with authorization error and zero foreign-object data.",
-                "Response returns or mutates foreign tenant objects under the current context.",
-                "Unauthorized cross-database or cross-tenant object access.",
-                evidenceFor(base, signals, methodContext, chainPath, pair),
-                mutated,
-                signals,
-                true,
-                methodContext.isWriteOrAdminSensitive()
+                RoleType sourceRole = roleFor(evidence.sourceContext(), contextsByKey);
+                RoleType targetRole = roleFor(evidence.targetContext(), contextsByKey);
+                if (targetRole == RoleType.ADMIN) {
+                    continue; // "Replay as ADMIN" is not a useful attack suggestion
+                }
+                if (sourceRole == targetRole && sourceRole != RoleType.UNKNOWN) {
+                    continue; // Same known privilege level — skip
+                }
+
+                String confidence = confidenceFor(evidence.targetContext(), evidence.sourceContext(), contextsByKey);
+                if ("LOW".equals(confidence)) {
+                    continue;
+                }
+
+                AuthContextStore.SessionView targetContext = contextsByKey.get(evidence.targetContext());
+                if (targetContext == null) {
+                    continue;
+                }
+
+                String entityId = extractEntityIdFromResponse(evidence.sourceResponse(), entitiesById);
+                if (entityId.isBlank()) {
+                    entityId = extractEntityIdFromResponse(evidence.targetResponse(), entitiesById);
+                }
+
+                String fallbackRequest = buildFallbackBody(
+                        method,
+                        typeName,
+                        targetContext.database(),
+                        targetContext.sessionId(),
+                        targetContext.userName(),
+                        entityId
+                );
+
+                RequestObservation pseudo = new RequestObservation(
+                        methodKey + "|" + evidence.targetContext(),
+                        "",
+                        Instant.now(),
+                    defaultIfBlank(targetContext.host(), DEFAULT_TARGET_HOST),
+                        method,
+                        method,
+                        typeName,
+                        evidence.targetContext(),
+                        defaultIfBlank(targetContext.sessionId(), ""),
+                        defaultIfBlank(targetContext.database(), "unknown-db"),
+                        defaultIfBlank(targetContext.userName(), "unknown-user"),
+                        entityId.isBlank() ? List.of() : List.of(entityId),
+                        false,
+                        false,
+                        List.of(),
+                        List.of(),
+                        false,
+                        false,
+                        "named",
+                        false,
+                        fallbackRequest,
+                        defaultIfBlank(evidence.targetResponse(), ""),
+                        null,
+                        false
+                );
+
+                String payload = buildPayloadHttp(pseudo, entityId);
+                String curl = buildCurlCommand(payload);
+                String exactAttackAction = "Replay the same request fingerprint for " + method + ":" + typeName
+                        + " from source context " + evidence.sourceContext()
+                        + " into target context " + evidence.targetContext()
+                        + " and compare response structure and fields.";
+                String exploitChain = buildExploitChain(pseudo, evidence.sourceContext(), evidence.targetContext(), entityId, workflowSnapshot);
+                if (!exploitChain.isBlank()) {
+                    exactAttackAction = exactAttackAction + " " + exploitChain;
+                }
+
+                AttackSuggestion finding = buildFinding(
+                        "PRIVILEGE_DIFF",
+                        "Privilege Differential",
+                        confidence,
+                        pseudo,
+                        evidence.sourceContext(),
+                        evidence.targetContext(),
+                        entityId,
+                        defaultIfBlank(evidence.reason(), "Comparable request fingerprint produces divergent responses."),
+                        exactAttackAction,
+                        defaultIfBlank(evidence.sourceResponse(), ""),
+                        defaultIfBlank(evidence.targetResponse(), ""),
+                        payload,
+                        curl,
+                        "Privilege boundary weakness through response-level authorization drift.",
+                        "Privilege differential"
+                );
+                putFinding(out, finding);
+            }
+        }
+    }
+
+    private void runMulticallDetector(
+            List<RequestObservation> observations,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, List<MethodDiffEvidence>> methodDiffEvidence,
+            Map<String, Set<String>> entityToContexts,
+            Map<String, Set<String>> methodToContexts,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot,
+            Map<String, AttackSuggestion> out
+    ) {
+        for (RequestObservation observation : observations) {
+            if (!observation.multiCall()) {
+                continue;
+            }
+
+            List<String> reasons = new ArrayList<>();
+            if (observation.emptySearchInSubCall()) {
+                reasons.add("ExecuteMultiCall contains sub-call with search:{} allowing broad enumeration behavior.");
+            }
+            if (observation.hasWriteSubCall()) {
+                reasons.add("ExecuteMultiCall contains write-like sub-call mixed with read access in one chain.");
+            }
+            if (observation.hasMixedPrivilegeChain()) {
+                reasons.add("ExecuteMultiCall chain mixes read and write semantics that can hide unauthorized state changes.");
+            }
+            if (!observation.subCallMethods().isEmpty()) {
+                reasons.add("ExecuteMultiCall sub-call breakdown: " + observation.subCallMethods());
+            }
+
+            boolean adminOnlySubType = hasAdminOnlySubType(
+                    observation.subCallTypeNames(),
+                    methodStore,
+                    contextsByKey,
+                    observation.contextKey()
+            );
+            if (adminOnlySubType) {
+                reasons.add("One or more sub-call type names are only seen in ADMIN contexts.");
+            }
+
+            if (reasons.isEmpty()) {
+                continue;
+            }
+
+            String targetContext = defaultIfBlank(observation.contextKey(), "");
+            if (targetContext.isBlank()) {
+                continue;
+            }
+
+            String sourceContext = pickSourceContextForSubCalls(
+                    observation.subCallMethods(),
+                    methodToContexts,
+                    targetContext,
+                    contextsByKey
+            );
+            if (sourceContext.isBlank()) {
+                sourceContext = pickSourceContext(
+                        methodToContexts.getOrDefault(buildMethodKey(observation.method(), observation.typeName()), Set.of()),
+                        targetContext,
+                        contextsByKey
+                );
+            }
+
+            if (sourceContext.isBlank() && reasons.size() < 2) {
+                continue;
+            }
+
+            RoleType targetRole = roleFor(targetContext, contextsByKey);
+            String confidence;
+            if (targetRole == RoleType.LOW_PRIV && (observation.hasWriteSubCall() || adminOnlySubType)) {
+                confidence = "HIGH";
+            } else if (targetRole == RoleType.LOW_PRIV || adminOnlySubType || observation.hasMixedPrivilegeChain()) {
+                confidence = "MEDIUM";
+            } else {
+                confidence = "LOW";
+            }
+            if ("LOW".equals(confidence)) {
+                continue;
+            }
+
+            String sourceResponse = sourceContext.isBlank()
+                    ? ""
+                    : findResponseForContext(methodStore, sourceContext, observation.method(), observation.typeName());
+            String targetResponse = defaultIfBlank(observation.responseBody(), "");
+            String sourceResponseClass = classifyResponse(sourceResponse);
+            String targetResponseClass = classifyResponse(targetResponse);
+
+            String methodKey = buildMethodKey(observation.method(), observation.typeName());
+            String diff = findMethodDifference(
+                    methodDiffEvidence,
+                    methodKey,
+                    sourceContext,
+                    targetContext,
+                    sourceResponse,
+                    targetResponse
+            );
+
+            String observedDifference = String.join(" ", reasons);
+            if (!diff.isBlank()) {
+                observedDifference = observedDifference + " Structural diff: " + diff;
+            }
+            observedDifference = observedDifference
+                    + " Source response class=" + sourceResponseClass
+                    + ", target response class=" + targetResponseClass + ".";
+
+            String entityId = observation.requestEntityIds().isEmpty() ? "" : observation.requestEntityIds().get(0);
+            if (entityId.isBlank() && !observation.subCallTypeNames().isEmpty()) {
+                String synthetic = observation.subCallTypeNames().get(0);
+                entityId = synthetic == null ? "" : synthetic;
+            }
+
+            if (!entityId.isBlank() && !observation.hasWriteSubCall() && !observation.hasMixedPrivilegeChain()) {
+                Set<String> contexts = entityToContexts.getOrDefault(entityId, Set.of());
+                if (contexts.size() < 2 && sourceContext.isBlank()) {
+                    continue;
+                }
+            }
+
+            String exactAttackAction = "Replay ExecuteMultiCall from target context " + targetContext
+                    + " with sub-call methods " + observation.subCallMethods()
+                    + " and verify whether entities or fields associated with source context "
+                    + defaultIfBlank(sourceContext, "(inferred privileged path)") + " are returned or modified.";
+            String exploitChain = buildExploitChain(observation, defaultIfBlank(sourceContext, targetContext), targetContext, entityId, workflowSnapshot);
+            if (!exploitChain.isBlank()) {
+                exactAttackAction = exactAttackAction + " " + exploitChain;
+            }
+
+            String payload = buildPayloadHttp(observation, entityId);
+            String curl = buildCurlCommand(payload);
+
+            AttackSuggestion finding = buildFinding(
+                    "MULTICALL_CHAIN",
+                    "Batch / ExecuteMultiCall",
+                    confidence,
+                    observation,
+                    defaultIfBlank(sourceContext, targetContext),
+                    targetContext,
+                    entityId,
+                    observedDifference,
+                    exactAttackAction,
+                    sourceResponse,
+                    targetResponse,
+                    payload,
+                    curl,
+                    "Hidden write + read chain can leak privileged objects or mutate unauthorized state in a single request.",
+                    "ExecuteMultiCall abuse"
+            );
+            putFinding(out, finding);
+        }
+    }
+
+    private void runCrossTenantDetector(
+            List<RequestObservation> observations,
+            Map<String, EntityStoreService.ExtractedEntity> entitiesById,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, List<MethodDiffEvidence>> methodDiffEvidence,
+            Map<String, Set<String>> entityToContexts,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot,
+            Map<String, AttackSuggestion> out
+    ) {
+        for (RequestObservation observation : observations) {
+            if (isSuppressedMethod(observation.method()) || observation.requestEntityIds().isEmpty()) {
+                continue;
+            }
+
+            String targetContext = defaultIfBlank(observation.contextKey(), "");
+            if (targetContext.isBlank()) {
+                continue;
+            }
+
+            for (String entityId : observation.requestEntityIds()) {
+                EntityStoreService.ExtractedEntity entity = entitiesById.get(entityId);
+                if (entity == null) {
+                    continue;
+                }
+
+                String sourceDatabase = defaultIfBlank(entity.database(), "");
+                String targetDatabase = defaultIfBlank(observation.database(), "");
+                if (sourceDatabase.isBlank() || targetDatabase.isBlank() || sourceDatabase.equalsIgnoreCase(targetDatabase)) {
+                    continue;
+                }
+
+                Set<String> contexts = new LinkedHashSet<>(entityToContexts.getOrDefault(entityId, Set.of()));
+                contexts.add(targetContext);
+                if (contexts.size() < 2) {
+                    continue;
+                }
+
+                String sourceContext = defaultIfBlank(entity.contextKey(), "");
+                if (sourceContext.isBlank() || sourceContext.equals(targetContext)) {
+                    sourceContext = pickSourceContext(contexts, targetContext, contextsByKey);
+                }
+                if (sourceContext.isBlank()) {
+                    continue;
+                }
+
+                String sourceResponse = findResponseForContext(methodStore, sourceContext, observation.method(), observation.typeName());
+                String targetResponse = defaultIfBlank(observation.responseBody(), "");
+                String sourceResponseClass = classifyResponse(sourceResponse);
+                String targetResponseClass = classifyResponse(targetResponse);
+                String methodKey = buildMethodKey(observation.method(), observation.typeName());
+                String diff = findMethodDifference(
+                        methodDiffEvidence,
+                        methodKey,
+                        sourceContext,
+                        targetContext,
+                        sourceResponse,
+                        targetResponse
+                );
+
+                String observedDifference = "Entity " + entityId + " originally observed in database '" + sourceDatabase
+                        + "' but replayed in database '" + targetDatabase + "'.";
+                if (!diff.isBlank()) {
+                    observedDifference = observedDifference + " Structural diff: " + diff;
+                }
+                observedDifference = observedDifference
+                    + " Source response class=" + sourceResponseClass
+                    + ", target response class=" + targetResponseClass + ".";
+
+                String confidence = confidenceFor(targetContext, sourceContext, contextsByKey);
+                if ("LOW".equals(confidence) && diff.isBlank()) {
+                    continue;
+                }
+
+                String exactAttackAction = "Use entityId='" + entityId + "' from source database '" + sourceDatabase
+                        + "' while authenticated to target database '" + targetDatabase
+                        + "' under context " + targetContext + " and validate cross-tenant object retrieval.";
+                String exploitChain = buildExploitChain(observation, sourceContext, targetContext, entityId, workflowSnapshot);
+                if (!exploitChain.isBlank()) {
+                    exactAttackAction = exactAttackAction + " " + exploitChain;
+                }
+
+                String payload = buildPayloadHttp(observation, entityId);
+                String curl = buildCurlCommand(payload);
+
+                AttackSuggestion finding = buildFinding(
+                        "CROSS_TENANT",
+                        "Cross-Tenant / Cross-Database",
+                        confidence,
+                        observation,
+                        sourceContext,
+                        targetContext,
+                        entityId,
+                        observedDifference,
+                        exactAttackAction,
+                        sourceResponse,
+                        targetResponse,
+                        payload,
+                        curl,
+                        "Tenant isolation failure enables data access across organization boundaries.",
+                        "Cross-tenant replay"
+                );
+                putFinding(out, finding);
+            }
+        }
+    }
+
+    // ── NEW DETECTOR: Search Enumeration ──────────────────────────────────────
+    // Fires on standalone read methods (Get/Find/List/Search) with empty or
+    // no-ID-constraint search parameters — catches patterns like
+    // Get:DeviceStatusInfo {search:{isDeviceCommunicating:true}} that the
+    // entity-based BOLA detector misses because there's no entity ID in the request.
+    private void runSearchEnumerationDetector(
+            List<RequestObservation> observations,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, Set<String>> methodToContexts,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot,
+            Map<String, AttackSuggestion> out
+    ) {
+        for (RequestObservation observation : observations) {
+            if (!observation.broadSearch()) {
+                continue;
+            }
+            if (isSuppressedMethod(observation.method())) {
+                continue;
+            }
+
+            String targetContext = defaultIfBlank(observation.contextKey(), "");
+            if (targetContext.isBlank()) {
+                continue;
+            }
+
+            // Skip if response is an error or permission denial — server is protecting correctly
+            String responseClass = classifyResponse(observation.responseBody());
+            if ("permission_error".equals(responseClass) || "error".equals(responseClass)
+                    || "empty_result".equals(responseClass) || "empty".equals(responseClass)) {
+                continue;
+            }
+
+            RoleType targetRole = roleFor(targetContext, contextsByKey);
+
+            String methodKey = buildMethodKey(observation.method(), observation.typeName());
+            Set<String> contexts = methodToContexts.getOrDefault(methodKey, Set.of());
+            String sourceContext = pickSourceContext(contexts, targetContext, contextsByKey);
+
+            String confidence;
+            if (targetRole == RoleType.LOW_PRIV) {
+                confidence = "HIGH";
+            } else if (!sourceContext.isBlank()) {
+                confidence = "MEDIUM";
+            } else {
+                confidence = "MEDIUM";
+            }
+
+            String observedDifference = "Method " + observation.method() + ":" + observation.typeName()
+                    + " uses broad/unrestricted search parameters (no entity-ID constraint)."
+                    + " Response class=" + responseClass + ".";
+
+            if (!sourceContext.isBlank()) {
+                String sourceResponse = findResponseForContext(methodStore, sourceContext, observation.method(), observation.typeName());
+                String sourceResponseClass = classifyResponse(sourceResponse);
+                if (!"empty".equals(sourceResponseClass)) {
+                    observedDifference += " Source(" + roleFor(sourceContext, contextsByKey).displayName()
+                            + ") response class=" + sourceResponseClass + ".";
+                }
+            }
+
+            String exactAttackAction = "Send " + observation.method() + ":" + observation.typeName()
+                    + " with empty or broad search parameters as LOW_PRIV user."
+                    + " If response contains objects, verify whether each belongs to the authenticated user."
+                    + " Absence of ownership filtering indicates BOLA.";
+            String exploitChain = buildExploitChain(observation, defaultIfBlank(sourceContext, targetContext),
+                    targetContext, "", workflowSnapshot);
+            if (!exploitChain.isBlank()) {
+                exactAttackAction = exactAttackAction + " " + exploitChain;
+            }
+
+            String payload = buildPayloadHttp(observation, "");
+            String curl = buildCurlCommand(payload);
+
+            String sourceResponse = sourceContext.isBlank() ? ""
+                    : findResponseForContext(methodStore, sourceContext, observation.method(), observation.typeName());
+
+            AttackSuggestion finding = buildFinding(
+                    "SEARCH_ENUM",
+                    "Search Enumeration / Mass Object Access",
+                    confidence,
+                    observation,
+                    defaultIfBlank(sourceContext, targetContext),
+                    targetContext,
+                    "",
+                    observedDifference,
+                    exactAttackAction,
+                    sourceResponse,
+                    defaultIfBlank(observation.responseBody(), ""),
+                    payload,
+                    curl,
+                    "Broad search without ownership filter enables enumeration of objects belonging to other users/tenants.",
+                    "Search enumeration"
+            );
+            putFinding(out, finding);
+        }
+    }
+
+    // ── NEW DETECTOR: Method-Level Access Control ─────────────────────────────
+    // Fires when a security-sensitive method (name contains admin, security,
+    // billing, permission, token, export, etc.) has been called by both ADMIN
+    // and LOW_PRIV contexts, and the LOW_PRIV response was NOT a permission error.
+    // Catches GetReportSecurityIdentifiers, ExportReport, etc.
+    private void runMethodAccessDetector(
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot,
+            Map<String, AttackSuggestion> out
+    ) {
+        List<String> sensitiveTerms = List.of(
+                "admin", "security", "export", "billing", "permission",
+                "token", "grant", "assign", "reportschedule", "systemsetting",
+                "clearance", "certificate", "credential"
         );
+
+        for (JsonRpcIndex.MethodStoreView view : methodStore) {
+            if (isSuppressedMethod(view.method())) {
+                continue;
+            }
+
+            String methodLower = view.method().toLowerCase(Locale.ROOT);
+            String typeNameLower = view.typeName().toLowerCase(Locale.ROOT);
+            boolean sensitive = false;
+            for (String term : sensitiveTerms) {
+                if (methodLower.contains(term) || typeNameLower.contains(term)) {
+                    sensitive = true;
+                    break;
+                }
+            }
+            if (!sensitive) {
+                continue;
+            }
+
+            List<String> sessions = view.seenInSessions();
+            if (sessions.size() < 2) {
+                continue;
+            }
+
+            String adminContext = "";
+            String lowPrivContext = "";
+            for (String session : sessions) {
+                RoleType role = roleFor(session, contextsByKey);
+                if (role == RoleType.ADMIN && adminContext.isBlank()) {
+                    adminContext = session;
+                } else if (role == RoleType.LOW_PRIV && lowPrivContext.isBlank()) {
+                    lowPrivContext = session;
+                }
+            }
+
+            if (adminContext.isBlank() || lowPrivContext.isBlank()) {
+                continue;
+            }
+
+            // Get responses for both contexts
+            String adminResponse = "";
+            String lowPrivResponse = "";
+            for (JsonRpcIndex.SessionSnapshot snap : view.sessionSnapshots()) {
+                if (adminContext.equals(snap.sessionId())) {
+                    adminResponse = defaultIfBlank(snap.lastResponse(), "");
+                }
+                if (lowPrivContext.equals(snap.sessionId())) {
+                    lowPrivResponse = defaultIfBlank(snap.lastResponse(), "");
+                }
+            }
+
+            String lowPrivResponseClass = classifyResponse(lowPrivResponse);
+            // If LOW_PRIV got a definitive permission error, server is protecting correctly
+            if ("permission_error".equals(lowPrivResponseClass)) {
+                continue;
+            }
+
+            String method = view.method();
+            String typeName = defaultIfBlank(view.typeName(), "Unknown");
+
+            AuthContextStore.SessionView lowPrivView = contextsByKey.get(lowPrivContext);
+            if (lowPrivView == null) {
+                continue;
+            }
+
+            String observedDifference = "Security-sensitive method " + method + ":" + typeName
+                    + " is accessible to LOW_PRIV context " + lowPrivContext
+                    + ". LOW_PRIV response class=" + lowPrivResponseClass + ".";
+
+            String fallbackRequest = buildFallbackBody(
+                    method, typeName,
+                    defaultIfBlank(lowPrivView.database(), ""),
+                    defaultIfBlank(lowPrivView.sessionId(), ""),
+                    defaultIfBlank(lowPrivView.userName(), ""), ""
+            );
+
+            RequestObservation pseudo = new RequestObservation(
+                    method + ":" + typeName + "|method_access|" + lowPrivContext,
+                    "", Instant.now(),
+                    defaultIfBlank(lowPrivView.host(), DEFAULT_TARGET_HOST),
+                    method, method, typeName, lowPrivContext,
+                    defaultIfBlank(lowPrivView.sessionId(), ""),
+                    defaultIfBlank(lowPrivView.database(), "unknown-db"),
+                    defaultIfBlank(lowPrivView.userName(), "unknown-user"),
+                    List.of(), false, false, List.of(), List.of(), false, false,
+                    "named", false, fallbackRequest,
+                    defaultIfBlank(lowPrivResponse, ""), null, false
+            );
+
+            String payload = buildPayloadHttp(pseudo, "");
+            String curl = buildCurlCommand(payload);
+
+            AttackSuggestion finding = buildFinding(
+                    "METHOD_ACCESS",
+                    "Sensitive Method Access",
+                    "HIGH",
+                    pseudo,
+                    adminContext,
+                    lowPrivContext,
+                    "",
+                    observedDifference,
+                    "Call " + method + ":" + typeName + " as LOW_PRIV and check if response contains admin-only data.",
+                    adminResponse,
+                    lowPrivResponse,
+                    payload,
+                    curl,
+                    "LOW_PRIV user can invoke security-sensitive method that requires elevated privileges.",
+                    "Method-level access control bypass"
+            );
+            putFinding(out, finding);
+        }
     }
 
-    private void emitCredentialSwapSuggestions(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            ObservedItem high,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath,
-            ContextPair pair
-    ) {
-        if (high == null || !signals.authPairAvailable()) {
-            return;
-        }
-        // Relax: allow credential suggestions when tenantReplayable even without chain evidence
-        if (!signals.chainConnected() && !signals.tenantReplayable()) {
-            return;
-        }
-        if (!signals.authDifferenceDetected() && !signals.tenantReplayable()) {
-            return;
-        }
-
-        if (!high.authContext().database().isBlank() && !high.authContext().database().equals(base.authContext().database())) {
-            String mutated = RepeaterRequestMutator.mutateCredentialField(
-                    base.httpRequestRaw(), base.rpcContext().callIndex(), "database", high.authContext().database());
-                createCredentialSuggestion(deduplicated, base, "database", high.authContext().database(), mutated, signals, methodContext, chainPath, pair);
-        }
-
-        if (!high.authContext().sessionId().isBlank() && !high.authContext().sessionId().equals(base.authContext().sessionId())) {
-            String mutated = RepeaterRequestMutator.mutateCredentialField(
-                    base.httpRequestRaw(), base.rpcContext().callIndex(), "sessionId", high.authContext().sessionId());
-                createCredentialSuggestion(deduplicated, base, "sessionId", high.authContext().sessionId(), mutated, signals, methodContext, chainPath, pair);
-        }
-
-        if (!high.authContext().userName().isBlank() && !high.authContext().userName().equals(base.authContext().userName())) {
-            String mutated = RepeaterRequestMutator.mutateCredentialField(
-                    base.httpRequestRaw(), base.rpcContext().callIndex(), "userName", high.authContext().userName());
-            createCredentialSuggestion(deduplicated, base, "userName", high.authContext().userName(), mutated, signals, methodContext, chainPath, pair);
-        }
+    private void putFinding(Map<String, AttackSuggestion> out, AttackSuggestion finding) {
+        // Dedup by type+session+entity+method — omit attackPath to avoid duplicate explosion
+        // when the same BOLA pattern is found from multiple source contexts.
+        String key = finding.findingType() + "|" + finding.sessionId() + "|" + finding.entityId() + "|"
+                + finding.method() + "|" + finding.typeName();
+        out.putIfAbsent(key, finding);
     }
 
-    private void createCredentialSuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            String credentialField,
-            String targetValue,
-            String mutated,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath,
-            ContextPair pair
-    ) {
-        if (mutated == null || mutated.isBlank() || mutated.equals(base.httpRequestRaw())) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                credentialField,
-                "Method-Level Authorization Bypass",
-                "Credential mutation (" + credentialField + ") on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "credentials." + credentialField),
-                reasonFor("Credentials." + credentialField + " differs across contexts and is directly attacker-controlled.", signals),
-                "Replays the exact request while swapping only credentials." + credentialField + " with a real captured value.",
-                "Server should reject credential-context mismatch and block cross-context action.",
-                "Server accepts swapped credentials and processes request in unauthorized context.",
-                "Privilege escalation or cross-database access via credential confusion.",
-                evidenceFor(base, signals, methodContext, chainPath, pair),
-                mutated,
-                signals,
-                true,
-                true
-        );
-    }
-
-    private void emitLowPrivReplaySuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath
-    ) {
-        if (base.authContext().role() != RoleType.LOW_PRIV) {
-            return;
-        }
-        if (!methodContext.isWriteOrAdminSensitive()) {
-            return;
-        }
-        if (!signals.chainConnected()) {
-            return;
-        }
-        if (!signals.lowPrivWriteSucceeded() && !signals.wrapperWriteReachable()) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                "low-priv-replay",
-                "Privilege Escalation / Write Replay",
-                "Low-priv replay of state-changing method " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "low-priv replay"),
-                reasonFor("Low-priv context observed on a write/admin-sensitive method; replay validates unauthorized state change risk.", signals),
-                "Uses the exact LOW_PRIV request bytes with no structural changes.",
-                "Server should enforce role checks and return explicit authorization denial.",
-                "LOW_PRIV request succeeds and changes backend state or privileged settings.",
-                "Unauthorized state changes and vertical privilege escalation.",
-                evidenceFor(base, signals, methodContext, chainPath),
-                base.httpRequestRaw(),
-                signals,
-                false,
-                true
-        );
-    }
-
-    private void emitAuthDifferentialSuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            ObservedItem high,
-            ContextPair pair,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath
-    ) {
-        if (pair == null || high == null || !signals.authDifferenceDetected() || !signals.roleDifferenceSeen()) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                "auth-diff",
-                "Method-Level Authorization Bypass",
-                "Auth differential on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "auth differential"),
-                reasonFor("Same method+typeName behaves differently across sessionId/database/userName contexts.", signals),
-                "Compares outcomes across paired contexts with A↔B credential/entity swaps.",
-                "Behavior should be consistent with strict authorization boundaries for both contexts.",
-                "One context gains unauthorized object access or state-change capability.",
-                "Cross-account data leakage and privilege boundary bypass.",
-                evidenceFor(base, signals, methodContext, chainPath, pair),
-                base.httpRequestRaw(),
-                signals,
-                false,
-                methodContext.isWriteOrAdminSensitive()
-        );
-    }
-
-    private void emitBatchAuthorizationSuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            EntitySwapTarget swapTarget,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath
-    ) {
-        if (!base.rpcContext().batchRequest() && !methodContext.wrapper() && base.rpcContext().nestedMethods().isEmpty()) {
-            return;
-        }
-        if (!signals.wrapperWriteReachable() && !signals.authDifferenceDetected()) {
-            return;
-        }
-
-        String mutated = swapTarget.present()
-                ? mutateUsingSwapTarget(base, swapTarget)
-                : base.httpRequestRaw();
-
-        createAndPut(
-                deduplicated,
-                base,
-                swapTarget.present() ? swapTarget.newValue() : "batch",
-                "Method-Level Authorization Bypass",
-                "Batch / MultiCall authorization check for " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "nested authorization"),
-                reasonFor("Batch/wrapper call can mix privilege contexts; per-call authorization must be validated.", signals),
-                "Replays captured batch/multicall shape with context-swapped entity/credential values.",
-                "Every nested call should enforce authorization independently.",
-                "Unauthorized nested calls succeed when outer request is accepted.",
-                "Privilege pivot inside batched execution path.",
-                evidenceFor(base, signals, methodContext, chainPath),
-                mutated,
-                signals,
-                swapTarget.present(),
-                true
-        );
-    }
-
-    private void emitNotificationSuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath
-    ) {
-        if (base.rpcContext().notificationRequest()) {
-            return;
-        }
-        if (!methodContext.notificationCapable() || !methodContext.isWriteOrAdminSensitive()) {
-            return;
-        }
-        if (!signals.chainConnected()) {
-            return;
-        }
-
-        String mutated = RepeaterRequestMutator.removeRequestId(base.httpRequestRaw(), base.rpcContext().callIndex());
-        if (mutated.equals(base.httpRequestRaw())) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                "notification",
-                "Unauthorized State Change",
-                "Notification-mode auth check on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "remove id"),
-                reasonFor("Removing JSON-RPC id converts request to notification and can bypass response-gated auth paths.", signals),
-                "Patches only the id field to send an otherwise identical notification request.",
-                "Authorization and state-change checks must remain identical with or without id.",
-                "Notification path bypasses checks and performs unauthorized action.",
-                "Silent unauthorized operations without traceable response body.",
-                evidenceFor(base, signals, methodContext, chainPath),
-                mutated,
-                signals,
-                true,
-                methodContext.isWriteOrAdminSensitive()
-        );
-    }
-
-    private void emitParamEncodingSuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath
-    ) {
-        if (!signals.authDifferenceDetected() && !signals.responseRichnessMismatch()) {
-            return;
-        }
-
-        String mutated;
-        String mode;
-        if ("named".equals(base.rpcContext().paramsMode())) {
-            mutated = RepeaterRequestMutator.convertNamedToPositional(base.httpRequestRaw(), base.rpcContext().callIndex());
-            mode = "named->positional";
-        } else if ("positional".equals(base.rpcContext().paramsMode())) {
-            mutated = RepeaterRequestMutator.convertPositionalToNamed(base.httpRequestRaw(), base.rpcContext().callIndex());
-            mode = "positional->named";
-        } else {
-            return;
-        }
-
-        if (mutated.equals(base.httpRequestRaw())) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                mode,
-                "Method-Level Authorization Bypass",
-                "Param encoding conversion on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, mode),
-                reasonFor("Authorization logic may diverge between named and positional parameter handlers.", signals),
-                "Converts params encoding while preserving method, credentials, and endpoint bytes.",
-                "Equivalent parameter encodings should enforce identical authorization decisions.",
-                "One encoding bypasses checks and returns unauthorized data/actions.",
-                "Parser differential leading to authorization bypass.",
-                evidenceFor(base, signals, methodContext, chainPath),
-                mutated,
-                signals,
-                true,
-                methodContext.isWriteOrAdminSensitive()
-        );
-    }
-
-    private void emitNestedParamIntegritySuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath
-    ) {
-        if (!signals.chainConnected()) {
-            return;
-        }
-        if (!signals.authDifferenceDetected() && !signals.responseRichnessMismatch() && !signals.tenantReplayable()) {
-            return;
-        }
-
-        String removed = RepeaterRequestMutator.removeOneNestedParam(base.httpRequestRaw(), base.rpcContext().callIndex());
-        String extra = RepeaterRequestMutator.addExtraParam(base.httpRequestRaw(), base.rpcContext().callIndex(), "lhExtra", "probe");
-        String reordered = RepeaterRequestMutator.reorderParams(base.httpRequestRaw(), base.rpcContext().callIndex());
-
-        String mutated = !removed.equals(base.httpRequestRaw()) ? removed
-                : (!extra.equals(base.httpRequestRaw()) ? extra : reordered);
-
-        if (mutated.equals(base.httpRequestRaw())) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                "nested-params",
-                "Method-Level Authorization Bypass",
-                "Missing/extra/reordered nested params check on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "nested param mutation"),
-                reasonFor("Nested parameter validation can fail-open when fields are missing, reordered, or unexpected.", signals),
-                "Mutates only params object shape while preserving full request context and credentials.",
-                "Server should reject malformed shape and never fall back to permissive authorization defaults.",
-                "Malformed nested params still execute unauthorized data access/state changes.",
-                "Fail-open parser behavior with authorization impact.",
-                evidenceFor(base, signals, methodContext, chainPath),
-                mutated,
-                signals,
-                true,
-                methodContext.isWriteOrAdminSensitive()
-        );
-    }
-
-    private void emitEntityReplaySuggestion(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            EntitySwapTarget swapTarget,
-            SignalSet signals,
-            MethodContext methodContext,
-            String chainPath,
-            ContextPair pair
-    ) {
-        if (!swapTarget.present()) {
-            return;
-        }
-        // Relax: allow entity replay when tenantReplayable even without chain evidence
-        if (!signals.chainConnected() && !signals.tenantReplayable()) {
-            return;
-        }
-        if (!signals.idsReusedAcrossContexts() && !signals.tenantReplayable() && !signals.responsesExposeTenantObjects()) {
-            return;
-        }
-
-        String mutated = mutateUsingSwapTarget(base, swapTarget);
-        if (mutated.equals(base.httpRequestRaw())) {
-            return;
-        }
-
-        createAndPut(
-                deduplicated,
-                base,
-                swapTarget.newValue(),
-                "BOLA / IDOR Entity Replay",
-                "Entity replay using response-derived ID on " + base.methodName(),
-                composeAttackPath(base.methodName(), chainPath, "replay response ID:" + swapTarget.fieldKey()),
-                reasonFor("ID reused from prior responses is accepted in a new context (classic BOLA/IDOR pattern).", signals),
-                "Reuses real IDs extracted from captured responses; request shape remains unchanged.",
-                "Server should bind object ownership to current tenant/user context.",
-                "Foreign object is returned or modified using replayed response ID.",
-                "Unauthorized object access and cross-account data exposure.",
-                evidenceFor(base, signals, methodContext, chainPath, pair),
-                mutated,
-                signals,
-                true,
-                methodContext.isWriteOrAdminSensitive()
-        );
-    }
-
-    private void createAndPut(
-            Map<String, AttackSuggestion> deduplicated,
-            ObservedItem base,
-            String entityKey,
+    private AttackSuggestion buildFinding(
+            String findingType,
             String category,
-            String title,
-            String attackPath,
-            String reason,
-            String observation,
-            String expected,
-            String ifVulnerable,
+            String confidence,
+            RequestObservation observation,
+            String sourceContext,
+            String targetContext,
+            String entityId,
+            String observedDifference,
+            String exactAttackAction,
+            String adminResponse,
+            String lowPrivResponse,
+            String payload,
+            String curl,
             String impact,
-            String evidence,
-            String repeaterRequest,
-            SignalSet signals,
-            boolean mutated,
-            boolean stateChangeRisk
+            String pathSegment
     ) {
-        String dedupKey = base.methodName() + "|" + defaultIfBlank(entityKey, category);
+        int confidenceScore = switch (confidence) {
+            case "HIGH" -> 90;
+            case "MEDIUM" -> 75;
+            default -> 60;
+        };
+        int effectiveness = switch (confidence) {
+            case "HIGH" -> 88;
+            case "MEDIUM" -> 74;
+            default -> 60;
+        };
+        int priority = calculatePriorityScore(findingType, observation, confidenceScore, entityId);
+        SecurityFinding.RiskLevel risk = SecurityFinding.RiskLevel.fromScore(priority);
+        AttackSuggestion.Confidence confidenceEnum = switch (confidence) {
+            case "HIGH" -> AttackSuggestion.Confidence.HIGH;
+            case "MEDIUM" -> AttackSuggestion.Confidence.MEDIUM;
+            default -> AttackSuggestion.Confidence.LOW;
+        };
 
-        int confidenceScore = confidenceScore(signals, mutated, stateChangeRisk);
-        int effectivenessScore = effectivenessScore(signals, mutated, stateChangeRisk, !defaultIfBlank(entityKey, "").isBlank());
-        int priority = Math.min(100, (confidenceScore * 65 + effectivenessScore * 35) / 100);
+        String method = defaultIfBlank(observation.method(), "Get");
+        String typeName = defaultIfBlank(observation.typeName(), "Unknown");
+        RoleType sourceRole = roleFor(sourceContext, contextsByContextFromSessionId(sourceContext, targetContext, observation.contextKey()));
+        RoleType targetRole = roleFor(targetContext, contextsByContextFromSessionId(sourceContext, targetContext, observation.contextKey()));
+        String title = findingType + " - " + method + ":" + typeName;
+        String expected = "{ \"result\": [], \"error\": \"InvalidUserException\" }";
+        String vulnerable = "result[] contains object data";
 
-        AttackSuggestion.Confidence confidence = confidenceScore >= 80
-                ? AttackSuggestion.Confidence.HIGH
-                : (confidenceScore >= 55 ? AttackSuggestion.Confidence.MEDIUM : AttackSuggestion.Confidence.LOW);
+        String attackPath = method + ":" + typeName + " -> "
+                + defaultIfBlank(sourceContext, "(unknown-source)")
+                + " => "
+                + defaultIfBlank(targetContext, "(unknown-target)")
+                + " -> " + pathSegment;
 
-        AttackSuggestion.Verdict verdict = confidenceScore >= 55
-                ? AttackSuggestion.Verdict.LIKELY_VULNERABILITY
-                : AttackSuggestion.Verdict.LIKELY_SAFE;
+        String observedBehavior = "Observed behavior:\n"
+                + "- Source context: " + defaultIfBlank(sourceContext, "(unknown)") + "\n"
+                + "- Target context: " + defaultIfBlank(targetContext, "(unknown)") + "\n"
+            + "- Roles: source=" + sourceRole.displayName() + ", target=" + targetRole.displayName() + "\n"
+            + "- Priority: " + risk.displayName().toUpperCase(Locale.ROOT) + "\n"
+                + "- Entity used: " + defaultIfBlank(entityId, "(none)") + "\n"
+                + "- Difference: " + defaultIfBlank(observedDifference, "No direct structural diff; entity/context reuse indicates exploitable path.");
 
-        AttackSuggestion suggestion = new AttackSuggestion(
-                suggestionId(dedupKey + "|" + category + "|" + title),
+        String whyExploitable = "Why this is exploitable:\n"
+                + "- Same business method can be reached from two contexts with divergent behavior.\n"
+                + "- Replayed identifiers/context state can drive object access or privilege boundaries incorrectly.\n"
+                + "- This path is evidence-backed by captured traffic correlations.";
+
+        String evidence = "sourceContext=" + defaultIfBlank(sourceContext, "")
+                + ", targetContext=" + defaultIfBlank(targetContext, "")
+                + ", database=" + observation.database()
+                + ", userName=" + observation.userName()
+                + ", entityId=" + defaultIfBlank(entityId, "(none)")
+                + "\nobservedDifference=" + defaultIfBlank(observedDifference, "(none)")
+                + "\nexactAttackAction=" + defaultIfBlank(exactAttackAction,
+                "Replay captured request in target context with source entity identifiers.");
+
+        String comparison = buildComparisonBlock(adminResponse, lowPrivResponse);
+        if (!comparison.isBlank()) {
+            evidence = evidence + "\n" + comparison;
+        }
+
+        String bugcrowd = buildBugcrowdMarkdown(
+                title,
+                observation,
+                sourceContext,
+                targetContext,
+                entityId,
+                observedDifference,
+                exactAttackAction,
+                adminResponse,
+                lowPrivResponse,
+                impact,
+                curl
+        );
+
+        String exploitActionPayload = "Exact attack to try:\n"
+                + defaultIfBlank(exactAttackAction,
+                "Replay the same request in target context using source entity values.")
+                + "\n\n" + payload;
+
+        return new AttackSuggestion(
+                suggestionId(findingType + "|" + defaultIfBlank(sourceContext, "") + "|" + defaultIfBlank(targetContext, "")
+                        + "|" + method + "|" + typeName + "|" + entityId),
                 category,
                 title,
                 priority,
-                SecurityFinding.RiskLevel.fromScore(priority),
-                confidence,
-                verdict,
-                defaultIfBlank(base.methodName(), "(multiple)"),
+                risk,
+                confidenceEnum,
+                AttackSuggestion.Verdict.LIKELY_VULNERABILITY,
+                method,
                 attackPath,
-                observation,
-                reason,
-                repeaterRequest,
+                observedBehavior,
+                whyExploitable,
+                exploitActionPayload,
                 expected,
-                ifVulnerable,
+                vulnerable,
                 impact,
                 evidence,
-                base.host(),
+                defaultIfBlank(observation.host(), DEFAULT_TARGET_HOST),
                 confidenceScore,
-                effectivenessScore,
-                repeaterRequest
-        );
-
-        AttackSuggestion existing = deduplicated.get(dedupKey);
-        if (existing == null || suggestion.priorityScore() > existing.priorityScore()) {
-            deduplicated.put(dedupKey, suggestion);
-        }
-    }
-
-    private String mutateUsingSwapTarget(ObservedItem base, EntitySwapTarget swapTarget) {
-        if (swapTarget == null || !swapTarget.present()) {
-            return base.httpRequestRaw();
-        }
-
-        String mutated = RepeaterRequestMutator.mutateFirstMatchingKeyValueInParams(
-                base.httpRequestRaw(),
-                base.rpcContext().callIndex(),
-                swapTarget.fieldKey(),
-                swapTarget.oldValue(),
-                swapTarget.newValue()
-        );
-
-        if (!mutated.equals(base.httpRequestRaw())) {
-            return mutated;
-        }
-
-        return RepeaterRequestMutator.mutateFirstMatchingValueInParams(
-                base.httpRequestRaw(),
-                base.rpcContext().callIndex(),
-                swapTarget.oldValue(),
-                swapTarget.newValue()
+                effectiveness,
+                rawRequestOnly(payload),
+                findingType,
+                confidence,
+                defaultIfBlank(targetContext, observation.contextKey()),
+                defaultIfBlank(entityId, ""),
+                method,
+                typeName,
+                defaultIfBlank(adminResponse, ""),
+                defaultIfBlank(lowPrivResponse, ""),
+                payload,
+                bugcrowd
         );
     }
 
-    private String composeAttackPath(String methodName, String chainPath, String mutationLabel) {
-        String chain = chainPath == null || chainPath.isBlank() ? methodName : chainPath;
-        if (chain.equals(methodName)) {
-            return methodName + " -> " + mutationLabel;
+    private Map<String, AuthContextStore.SessionView> contextsByContextFromSessionId(String sourceContext, String targetContext, String fallbackContext) {
+        Map<String, AuthContextStore.SessionView> contexts = new HashMap<>();
+        for (AuthContextStore.SessionView session : authContextStore.snapshotSessions()) {
+            if (session == null || session.contextKey() == null || session.contextKey().isBlank()) {
+                continue;
+            }
+            if (session.contextKey().equals(sourceContext)
+                    || session.contextKey().equals(targetContext)
+                    || session.contextKey().equals(fallbackContext)) {
+                contexts.put(session.contextKey(), session);
+            }
         }
-        return chain + " | test=" + methodName + " -> " + mutationLabel;
+        return contexts;
     }
 
-    private int confidenceScore(SignalSet signals, boolean mutated, boolean stateChangeRisk) {
-        int score = 20;
-        if (signals.authDifferenceDetected()) score += 18;
-        if (signals.responseRichnessMismatch()) score += 14;
-        if (signals.idsReusedAcrossContexts()) score += 12;
-        if (signals.tenantReplayable()) score += 10;
-        if (signals.tenantOrDatabaseVisible()) score += 10;
-        if (signals.lowPrivWriteSucceeded()) score += 16;
-        if (signals.batchMixPrivilege()) score += 8;
-        if (signals.wrapperWriteReachable()) score += 8;
-        if (signals.responsesExposeTenantObjects()) score += 8;
-        if (signals.roleDifferenceSeen()) score += 8;
-        if (signals.chainConnected()) score += 8;
-        if (signals.methodRiskScore() >= 75) score += 6;
-        if (mutated) score += 4;
-        if (stateChangeRisk) score += 4;
-        return Math.min(100, score);
+    private int calculatePriorityScore(String findingType, RequestObservation observation, int confidenceScore, String entityId) {
+        int score = confidenceScore;
+        boolean writeLike = isWriteLikeMethod(observation.method()) || observation.hasWriteSubCall();
+        boolean escalationLike = "PRIVILEGE_DIFF".equals(findingType) || observation.hasMixedPrivilegeChain();
+        boolean idorLike = "BOLA_IDOR".equals(findingType) || "CROSS_TENANT".equals(findingType);
+        boolean sensitiveEntity = entityId != null && !entityId.isBlank();
+
+        if (writeLike || escalationLike) {
+            score = Math.max(score, 85);
+        }
+        if (idorLike && sensitiveEntity) {
+            score = Math.max(score, 68);
+        }
+        if (!writeLike && !escalationLike && idorLike) {
+            score = Math.max(score, 40);
+        }
+        return Math.min(score, 100);
     }
 
-    private int effectivenessScore(SignalSet signals, boolean mutated, boolean stateChangeRisk, boolean hasRealEntity) {
-        int score = 44;
-        if (mutated) score += 16;
-        if (hasRealEntity) score += 12;
-        if (signals.authPairAvailable()) score += 8;
-        if (signals.responseRichnessMismatch()) score += 8;
-        if (signals.chainConnected()) score += 8;
-        if (signals.tenantReplayable()) score += 6;
-        if (stateChangeRisk) score += 6;
-        if (signals.chainCount() > 0) score += 4;
-        if (signals.methodRiskScore() >= 75) score += 6;
-        return Math.min(100, score);
-    }
-
-    private SignalSet buildSignals(
-            List<ObservedItem> items,
-            ContextPair pair,
-            int methodRisk,
-            int chainEdgeCount,
-            int chainCount,
-            MethodContext methodContext,
-            boolean methodInChainPath
+    private String buildExploitChain(
+            RequestObservation observation,
+            String sourceContext,
+            String targetContext,
+            String entityId,
+            WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot
     ) {
-        boolean authDiff = false;
-        boolean responseRichnessMismatch = false;
-        boolean idsReused = false;
-        boolean tenantVisible = false;
-        boolean tenantReplayable = false;
-        boolean lowWriteSucceeded = false;
-        boolean batchMix = false;
-        boolean wrapperWriteReachable = false;
-        boolean responseTenantExposure = false;
-        boolean roleDifferenceSeen = false;
-
-        if (pair != null && pair.highContextItem() != null && pair.lowContextItem() != null) {
-            authDiff = pair.highContextItem().responseSnapshot().objectCount() != pair.lowContextItem().responseSnapshot().objectCount()
-                    || !Objects.equals(pair.highContextItem().responseSnapshot().statusCode(), pair.lowContextItem().responseSnapshot().statusCode())
-                    || pair.highContextItem().responseSnapshot().hasError() != pair.lowContextItem().responseSnapshot().hasError();
-
-            responseRichnessMismatch = pair.highContextItem().responseSnapshot().fieldCount()
-                    != pair.lowContextItem().responseSnapshot().fieldCount()
-                    || Math.abs(pair.highContextItem().responseSnapshot().bodyLength()
-                    - pair.lowContextItem().responseSnapshot().bodyLength()) > 64;
-
-            Set<String> intersection = new HashSet<>(pair.highContextItem().entityContext().allValues());
-            intersection.retainAll(pair.lowContextItem().entityContext().allValues());
-            idsReused = !intersection.isEmpty();
-
-            Set<String> highTenant = new HashSet<>(pair.highContextItem().tenantContext().tenantValues());
-            Set<String> lowTenant = new HashSet<>(pair.lowContextItem().tenantContext().tenantValues());
-            highTenant.removeAll(lowTenant);
-            tenantReplayable = !highTenant.isEmpty();
-
-            // Cross-database detection: different databases = strong cross-tenant signal
-            String highDb = pair.highContextItem().authContext().database();
-            String lowDb = pair.lowContextItem().authContext().database();
-            boolean crossDatabase = !highDb.isBlank() && !lowDb.isBlank()
-                    && !highDb.equals("unknown-db") && !lowDb.equals("unknown-db")
-                    && !highDb.equals(lowDb);
-            if (crossDatabase) {
-                tenantReplayable = true;
-                // Cross-database implies auth difference even if response shapes are same
-                authDiff = true;
-            }
-
-            // Cross-user detection: different users in same database = privilege escalation vector
-            String highUser = pair.highContextItem().authContext().userName();
-            String lowUser = pair.lowContextItem().authContext().userName();
-            boolean crossUser = !highUser.isBlank() && !lowUser.isBlank()
-                    && !highUser.equals("unknown-user") && !lowUser.equals("unknown-user")
-                    && !highUser.equals(lowUser);
-            if (crossUser && !crossDatabase) {
-                tenantReplayable = true;
-            }
-
-            roleDifferenceSeen = pair.highContextItem().authContext().role() != pair.lowContextItem().authContext().role();
+        if (workflowSnapshot == null) {
+            return "";
         }
 
-        for (ObservedItem item : items) {
-            tenantVisible = tenantVisible
-                    || !item.tenantContext().database().isBlank()
-                    || !item.tenantContext().sessionId().isBlank()
-                    || !item.tenantContext().userName().isBlank();
-
-            if (item.authContext().role() == RoleType.LOW_PRIV
-                    && methodContext.isWriteOrAdminSensitive()
-                    && item.responseSnapshot().isSuccess()
-                    && !item.responseSnapshot().hasError()) {
-                lowWriteSucceeded = true;
-            }
-
-            batchMix = batchMix || item.rpcContext().batchRequest() || methodContext.wrapper();
-            if ((item.rpcContext().batchRequest() || methodContext.wrapper())
-                    && (!item.rpcContext().nestedMethods().isEmpty() || methodContext.isWriteOrAdminSensitive())) {
-                wrapperWriteReachable = true;
-            }
-            responseTenantExposure = responseTenantExposure || !item.entityContext().tenantLinkedValues().isEmpty();
-        }
-
-        boolean chainConnected = chainEdgeCount > 0 || chainCount > 0 || methodInChainPath;
-        int strongSignals = 0;
-        if (authDiff) strongSignals++;
-        if (responseRichnessMismatch) strongSignals++;
-        if (idsReused) strongSignals++;
-        if (tenantReplayable) strongSignals++;
-        if (lowWriteSucceeded) strongSignals++;
-        if (wrapperWriteReachable) strongSignals++;
-        if (responseTenantExposure) strongSignals++;
-
-        return new SignalSet(
-                pair != null,
-                authDiff,
-                responseRichnessMismatch,
-                idsReused,
-                tenantVisible,
-                tenantReplayable,
-                lowWriteSucceeded,
-                batchMix,
-                wrapperWriteReachable,
-                responseTenantExposure,
-                roleDifferenceSeen,
-                chainConnected,
-                strongSignals,
-                methodRisk,
-                chainEdgeCount,
-                chainCount
-        );
-    }
-
-    private ContextPair selectContextPair(List<ObservedItem> items) {
-        Map<String, List<ObservedItem>> contexts = new LinkedHashMap<>();
-        for (ObservedItem item : items) {
-            String key = item.authContext().contextKey();
-            contexts.computeIfAbsent(key, ignored -> new ArrayList<>()).add(item);
-        }
-
-        if (contexts.size() < 2) {
-            return null;
-        }
-
-        ObservedItem high = null;
-        ObservedItem low = null;
-
-        for (List<ObservedItem> contextItems : contexts.values()) {
-            if (contextItems.isEmpty()) {
-                continue;
-            }
-            ObservedItem candidate = contextItems.get(contextItems.size() - 1);
-            if (high == null || roleRank(candidate.authContext().role()) > roleRank(high.authContext().role())) {
-                high = candidate;
-            }
-            if (low == null || roleRank(candidate.authContext().role()) < roleRank(low.authContext().role())) {
-                low = candidate;
-            }
-        }
-
-        if (high == null || low == null) {
-            return null;
-        }
-
-        // If role-based selection resolved to the same context (e.g. both UNKNOWN),
-        // prefer a cross-database pair — this is the primary signal for cross-tenant testing
-        if (high.authContext().contextKey().equals(low.authContext().contextKey())) {
-            // Try to find two items from different databases first
-            ContextPair crossDbPair = findCrossDatabasePair(contexts);
-            if (crossDbPair != null) {
-                return crossDbPair;
-            }
-
-            // Fall back to any two distinct contexts
-            List<ObservedItem> flat = new ArrayList<>();
-            for (List<ObservedItem> contextItems : contexts.values()) {
-                flat.addAll(contextItems);
-            }
-            flat.sort(Comparator.comparing(ObservedItem::timestamp));
-            if (flat.size() < 2) {
-                return null;
-            }
-            high = flat.get(flat.size() - 1);
-            low = flat.get(flat.size() - 2);
-        }
-
-        return new ContextPair(high, low);
-    }
-
-    private ContextPair findCrossDatabasePair(Map<String, List<ObservedItem>> contexts) {
-        List<ObservedItem> representatives = new ArrayList<>();
-        for (List<ObservedItem> contextItems : contexts.values()) {
-            if (!contextItems.isEmpty()) {
-                representatives.add(contextItems.get(contextItems.size() - 1));
-            }
-        }
-
-        // Find two items from different databases
-        for (int i = 0; i < representatives.size(); i++) {
-            for (int j = i + 1; j < representatives.size(); j++) {
-                ObservedItem a = representatives.get(i);
-                ObservedItem b = representatives.get(j);
-                String dbA = a.authContext().database();
-                String dbB = b.authContext().database();
-                if (!dbA.isBlank() && !dbB.isBlank()
-                        && !dbA.equals("unknown-db") && !dbB.equals("unknown-db")
-                        && !dbA.equals(dbB)) {
-                    // Return the one with higher role rank as "high"
-                    return roleRank(a.authContext().role()) >= roleRank(b.authContext().role())
-                            ? new ContextPair(a, b)
-                            : new ContextPair(b, a);
-                }
-            }
-        }
-
-        // Also find two items from same database but different users
-        for (int i = 0; i < representatives.size(); i++) {
-            for (int j = i + 1; j < representatives.size(); j++) {
-                ObservedItem a = representatives.get(i);
-                ObservedItem b = representatives.get(j);
-                String userA = a.authContext().userName();
-                String userB = b.authContext().userName();
-                if (!userA.isBlank() && !userB.isBlank()
-                        && !userA.equals("unknown-user") && !userB.equals("unknown-user")
-                        && !userA.equals(userB)) {
-                    return roleRank(a.authContext().role()) >= roleRank(b.authContext().role())
-                            ? new ContextPair(a, b)
-                            : new ContextPair(b, a);
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private EntitySwapTarget selectEntitySwapTarget(List<ObservedItem> items, ObservedItem high, ObservedItem base) {
-        Map<String, String> baseRequestIds = base.entityContext().requestIds();
-        if (baseRequestIds.isEmpty()) {
-            return EntitySwapTarget.empty();
-        }
-
-        if (high != null) {
-            EntitySwapTarget highResponseCandidate = selectMatchingSwapByKey(
-                    baseRequestIds,
-                    high.entityContext().responseIds(),
-                    base.entityContext().allValues()
-            );
-            if (highResponseCandidate.present()) {
-                return highResponseCandidate;
-            }
-
-            EntitySwapTarget highRequestCandidate = selectMatchingSwapByKey(
-                    baseRequestIds,
-                    high.entityContext().requestIds(),
-                    base.entityContext().allValues()
-            );
-            if (highRequestCandidate.present()) {
-                return highRequestCandidate;
-            }
-        }
-
-        Set<String> responseEntities = new LinkedHashSet<>();
-        for (ObservedItem item : items) {
-            responseEntities.addAll(item.entityContext().responseValues());
-        }
-
-        for (Map.Entry<String, String> requestEntry : baseRequestIds.entrySet()) {
-            String key = requestEntry.getKey();
-            String oldValue = requestEntry.getValue();
-            if (oldValue == null || oldValue.isBlank()) {
-                continue;
-            }
-
-            for (String candidate : responseEntities) {
-                if (candidate == null || candidate.isBlank()) {
-                    continue;
-                }
-                if (candidate.equals(oldValue)) {
-                    continue;
-                }
-                if (base.entityContext().allValues().contains(candidate)) {
-                    continue;
-                }
-                return new EntitySwapTarget(key, oldValue, candidate);
-            }
-        }
-
-        return EntitySwapTarget.empty();
-    }
-
-    private EntitySwapTarget selectMatchingSwapByKey(
-            Map<String, String> baseRequestIds,
-            Map<String, String> foreignIds,
-            List<String> baseAllValues
-    ) {
-        for (Map.Entry<String, String> foreignEntry : foreignIds.entrySet()) {
-            String key = foreignEntry.getKey();
-            String foreignValue = foreignEntry.getValue();
-            if (key == null || key.isBlank() || foreignValue == null || foreignValue.isBlank()) {
-                continue;
-            }
-
-            String currentValue = baseRequestIds.get(key);
-            if (currentValue == null || currentValue.isBlank()) {
-                continue;
-            }
-            if (currentValue.equals(foreignValue)) {
-                continue;
-            }
-            if (baseAllValues.contains(foreignValue)) {
-                continue;
-            }
-
-            return new EntitySwapTarget(key, currentValue, foreignValue);
-        }
-
-        return EntitySwapTarget.empty();
-    }
-
-    private List<CallView> parseCallViews(String requestBody) {
-        JsonNode root = parseJson(requestBody);
-        if (root == null) {
-            return List.of();
-        }
-
-        List<CallView> calls = new ArrayList<>();
-        if (root instanceof ObjectNode objectNode) {
-            CallView call = toCallView(0, objectNode, false);
-            if (call != null) {
-                calls.add(call);
-            }
-            return calls;
-        }
-
-        if (!root.isArray()) {
-            return List.of();
-        }
-
-        for (int i = 0; i < root.size(); i++) {
-            JsonNode child = root.get(i);
-            if (child instanceof ObjectNode objectNode) {
-                CallView call = toCallView(i, objectNode, true);
-                if (call != null) {
-                    calls.add(call);
-                }
-            }
-        }
-
-        return calls;
-    }
-
-    private CallView toCallView(int callIndex, ObjectNode callNode, boolean batch) {
-        JsonNode methodNode = callNode.get("method");
-        if (methodNode == null || methodNode.isNull()) {
-            return null;
-        }
-
-        String method = methodNode.isTextual() ? methodNode.asText("") : methodNode.toString();
+        String method = defaultIfBlank(observation.method(), "");
         if (method.isBlank()) {
-            return null;
+            return "";
         }
 
-        JsonNode params = callNode.path("params");
-        String paramsMode;
-        if (params.isMissingNode()) {
-            paramsMode = "missing";
-        } else if (params.isNull()) {
-            paramsMode = "null";
-        } else if (params.isObject()) {
-            paramsMode = "named";
-        } else if (params.isArray()) {
-            paramsMode = "positional";
-        } else {
-            paramsMode = JsonShapeUtil.topLevelType(params);
+        for (WorkflowGraphService.ChainView chain : workflowSnapshot.chains()) {
+            if (chain == null || chain.methodSequence() == null || chain.methodSequence().isEmpty()) {
+                continue;
+            }
+            if (!chain.methodSequence().contains(method)) {
+                continue;
+            }
+
+            List<String> steps = chain.methodSequence();
+            if (steps.size() < 2) {
+                continue;
+            }
+
+            StringBuilder builder = new StringBuilder();
+            builder.append("Exploit chain: ")
+                    .append("step 1 extract entity '")
+                    .append(defaultIfBlank(entityId, "id"))
+                    .append("' from ")
+                    .append(steps.get(0))
+                    .append(" under ")
+                    .append(defaultIfBlank(sourceContext, "source context"))
+                    .append("; step 2 replay via ")
+                    .append(steps.get(Math.min(1, steps.size() - 1)))
+                    .append(" under ")
+                    .append(defaultIfBlank(targetContext, "target context"))
+                    .append(".");
+            return builder.toString();
         }
 
-        boolean notification = !callNode.has("id") || callNode.path("id").isNull();
-        String rpcVersion = callNode.path("jsonrpc").asText("2.0");
-        String typeName = findTypeName(params, 0);
-        List<String> nestedMethods = findNestedMethods(method, params);
-
-        return new CallView(callIndex, method, typeName, rpcVersion, batch, notification, paramsMode, nestedMethods, callNode, params);
+        if (isWriteLikeMethod(method) || observation.hasWriteSubCall()) {
+            return "Exploit chain: step 1 extract reusable ID from a privileged Get response; step 2 replay it into "
+                    + method + " to test unauthorized write behavior.";
+        }
+        return "";
     }
 
-    private String findTypeName(JsonNode node, int depth) {
-        if (node == null || node.isNull() || node.isMissingNode() || depth > 7) {
+    private String buildBugcrowdMarkdown(
+            String summary,
+            RequestObservation observation,
+            String sourceContext,
+            String targetContext,
+            String entityId,
+            String observedDifference,
+            String exactAttackAction,
+            String adminResponse,
+            String lowPrivResponse,
+            String impact,
+            String curl
+    ) {
+        String adminSession = extractSessionIdFromResponseContext(observation, adminResponse);
+        String lowResponsePreview = truncate(defaultIfBlank(lowPrivResponse, ""), 300);
+        return "## Summary\n"
+                + summary + "\n\n"
+                + "## Observed behavior\n"
+                + "- Source context: " + defaultIfBlank(sourceContext, "unknown") + "\n"
+                + "- Target context: " + defaultIfBlank(targetContext, "unknown") + "\n"
+                + "- Entity used: " + defaultIfBlank(entityId, "unknown") + "\n"
+                + "- Difference: " + defaultIfBlank(observedDifference, "No direct structural diff recorded") + "\n\n"
+                + "## Why this is exploitable\n"
+                + "The same functional path can be replayed across contexts with identifiers learned from another context, "
+                + "causing ownership/privilege boundaries to weaken.\n\n"
+                + "## Exact attack to try\n"
+                + "1. " + defaultIfBlank(exactAttackAction,
+                "Replay captured request in target context using source entity IDs.") + "\n"
+                + "2. Validate whether unauthorized object data is returned.\n\n"
+                + "## Steps to Reproduce\n"
+                + "1. Authenticate as source context (session/context: " + defaultIfBlank(adminSession, "unknown") + ")\n"
+                + "2. Capture response for " + observation.method() + " returning entity "
+                + defaultIfBlank(entityId, "unknown") + "\n"
+                + "3. Authenticate as target user (context: " + defaultIfBlank(targetContext, observation.contextKey()) + ")\n"
+                + "4. Replay request with target credentials using entity ID from step 2\n"
+                + "5. Observe: " + lowResponsePreview + "\n\n"
+                + "## Impact\n"
+                + impact + "\n\n"
+                + "## Proof of Concept\n"
+                + "```bash\n"
+                + curl + "\n"
+                + "```\n\n"
+                + "## Expected vs Actual\n"
+                + "Expected: access denied / empty result\n"
+                + "Actual: " + defaultIfBlank(lowPrivResponse, "") + "\n";
+    }
+
+    private String extractSessionIdFromResponseContext(RequestObservation observation, String adminResponse) {
+        if (adminResponse == null || adminResponse.isBlank()) {
+            return "";
+        }
+        for (RequestObservation candidate : observations.values()) {
+            if (!candidate.method().equals(observation.method())) {
+                continue;
+            }
+            if (Objects.equals(candidate.responseBody(), adminResponse)) {
+                return defaultIfBlank(candidate.contextKey(), candidate.sessionId());
+            }
+        }
+        return "";
+    }
+
+    private String rawRequestOnly(String payload) {
+        if (payload == null || payload.isBlank()) {
+            return "";
+        }
+        int marker = payload.indexOf("\nExpected secure:");
+        if (marker < 0) {
+            return payload;
+        }
+        return payload.substring(0, marker).trim();
+    }
+
+    private String buildPayloadHttp(RequestObservation observation, String entityId) {
+        String requestBody = mutateRequestBody(
+                observation.requestBody(),
+                observation.method(),
+                observation.typeName(),
+                observation.database(),
+                observation.sessionId(),
+                observation.userName(),
+                entityId
+        );
+
+        return "POST /apiv1 HTTP/2\n"
+            + "Host: " + defaultIfBlank(observation.host(), DEFAULT_TARGET_HOST) + "\n"
+                + "Content-Type: text/plain;charset=UTF-8\n\n"
+                + requestBody
+                + "\n\nExpected secure:  { \"result\": [], \"error\": \"InvalidUserException\" }"
+                + "\nVulnerable if:    result[] contains object data";
+    }
+
+    private String mutateRequestBody(
+            String originalBody,
+            String method,
+            String typeName,
+            String database,
+            String sessionId,
+            String userName,
+            String entityId
+    ) {
+        JsonNode root = parseJson(originalBody);
+        if (root == null) {
+            return buildFallbackBody(method, typeName, database, sessionId, userName, entityId);
+        }
+
+        JsonNode call = root;
+        if (root.isArray() && root.size() > 0 && root.get(0).isObject()) {
+            call = root.get(0);
+        }
+
+        if (!(call instanceof ObjectNode callObject)) {
+            return buildFallbackBody(method, typeName, database, sessionId, userName, entityId);
+        }
+
+        if (!defaultIfBlank(method, "").isBlank()) {
+            callObject.put("method", defaultIfBlank(method, "Get"));
+        }
+
+        JsonNode paramsNode = callObject.get("params");
+        ObjectNode paramsObject;
+        if (paramsNode instanceof ObjectNode node) {
+            paramsObject = node;
+        } else {
+            paramsObject = objectMapper.createObjectNode();
+            callObject.set("params", paramsObject);
+        }
+
+        if (!defaultIfBlank(typeName, "").isBlank()) {
+            paramsObject.put("typeName", typeName);
+        }
+
+        ObjectNode credentialsNode;
+        JsonNode existingCredentials = paramsObject.get("credentials");
+        if (existingCredentials instanceof ObjectNode node) {
+            credentialsNode = node;
+        } else {
+            credentialsNode = objectMapper.createObjectNode();
+            paramsObject.set("credentials", credentialsNode);
+        }
+
+        credentialsNode.put("database", defaultIfBlank(database, ""));
+        credentialsNode.put("sessionId", defaultIfBlank(sessionId, ""));
+        credentialsNode.put("userName", defaultIfBlank(userName, ""));
+
+        if (entityId != null && !entityId.isBlank()) {
+            applyEntityIdMutation(paramsObject, entityId);
+        }
+
+        try {
+            return objectMapper.writeValueAsString(root);
+        } catch (Exception ignored) {
+            return buildFallbackBody(method, typeName, database, sessionId, userName, entityId);
+        }
+    }
+
+    private String buildFallbackBody(
+            String method,
+            String typeName,
+            String database,
+            String sessionId,
+            String userName,
+            String entityId
+    ) {
+        ObjectNode root = objectMapper.createObjectNode();
+        root.put("method", defaultIfBlank(method, "Get"));
+
+        ObjectNode params = objectMapper.createObjectNode();
+        params.put("typeName", defaultIfBlank(typeName, "User"));
+
+        ObjectNode search = objectMapper.createObjectNode();
+        search.put("id", defaultIfBlank(entityId, ""));
+        params.set("search", search);
+
+        ObjectNode credentials = objectMapper.createObjectNode();
+        credentials.put("database", defaultIfBlank(database, ""));
+        credentials.put("sessionId", defaultIfBlank(sessionId, ""));
+        credentials.put("userName", defaultIfBlank(userName, ""));
+        params.set("credentials", credentials);
+
+        root.set("params", params);
+        try {
+            return objectMapper.writeValueAsString(root);
+        } catch (Exception ignored) {
+            return "{\"method\":\"Get\",\"params\":{\"typeName\":\"User\",\"search\":{\"id\":\"\"},\"credentials\":{\"database\":\"\",\"sessionId\":\"\",\"userName\":\"\"}}}";
+        }
+    }
+
+    private void applyEntityIdMutation(ObjectNode paramsObject, String entityId) {
+        JsonNode searchNode = paramsObject.get("search");
+        if (searchNode instanceof ObjectNode searchObject) {
+            if (searchObject.has("id")) {
+                searchObject.put("id", entityId);
+                return;
+            }
+
+            for (String field : List.of("deviceId", "userId", "groupId", "reportId", "entityId")) {
+                if (searchObject.has(field)) {
+                    searchObject.put(field, entityId);
+                    return;
+                }
+            }
+
+            searchObject.put("id", entityId);
+            return;
+        }
+
+        ObjectNode createdSearch = objectMapper.createObjectNode();
+        createdSearch.put("id", entityId);
+        paramsObject.set("search", createdSearch);
+    }
+
+    private String buildCurlCommand(AttackSuggestion suggestion) {
+        return buildCurlCommand(suggestion.payload());
+    }
+
+    private String buildCurlCommand(String payload) {
+        String raw = rawRequestOnly(payload);
+        String host = defaultIfBlank(extractHeader(raw, "Host"), DEFAULT_TARGET_HOST);
+        String path = extractRequestPath(raw);
+        int bodyIndex = raw.indexOf("\n\n");
+        String body = bodyIndex < 0 ? "{}" : raw.substring(bodyIndex + 2).trim();
+        String compact = body.replace("\r", "").replace("\n", " ").replace("  ", " ").trim();
+        return "curl -X POST 'https://" + host + path + "' "
+                + "-H 'Content-Type: text/plain;charset=UTF-8' "
+                + "-d '" + compact.replace("'", "'\\''") + "'";
+    }
+
+    private String extractHeader(String rawRequest, String headerName) {
+        if (rawRequest == null || rawRequest.isBlank() || headerName == null || headerName.isBlank()) {
+            return "";
+        }
+        String prefix = headerName.toLowerCase(Locale.ROOT) + ":";
+        for (String line : rawRequest.split("\\r?\\n")) {
+            if (line == null || line.isBlank()) {
+                break;
+            }
+            String lowered = line.toLowerCase(Locale.ROOT);
+            if (!lowered.startsWith(prefix)) {
+                continue;
+            }
+            String value = line.substring(line.indexOf(':') + 1).trim();
+            int colon = value.indexOf(':');
+            if (colon > 0 && value.indexOf(']') < 0) {
+                return value.substring(0, colon);
+            }
+            return value;
+        }
+        return "";
+    }
+
+    private String extractRequestPath(String rawRequest) {
+        if (rawRequest == null || rawRequest.isBlank()) {
+            return DEFAULT_TARGET_PATH;
+        }
+        String[] lines = rawRequest.split("\\r?\\n", 2);
+        if (lines.length == 0 || lines[0].isBlank()) {
+            return DEFAULT_TARGET_PATH;
+        }
+        String[] parts = lines[0].trim().split("\\s+");
+        if (parts.length < 2 || parts[1].isBlank()) {
+            return DEFAULT_TARGET_PATH;
+        }
+        return parts[1].startsWith("/") ? parts[1] : "/" + parts[1];
+    }
+
+    private String findResponseForContext(
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            String contextKey,
+            String method,
+            String typeName
+    ) {
+        if (contextKey == null || contextKey.isBlank()) {
+            return "";
+        }
+
+        String key = buildMethodKey(method, typeName);
+        for (JsonRpcIndex.MethodStoreView view : methodStore) {
+            if (!view.key().equals(key)) {
+                continue;
+            }
+            for (JsonRpcIndex.SessionSnapshot snapshot : view.sessionSnapshots()) {
+                if (contextKey.equals(snapshot.sessionId())) {
+                    return defaultIfBlank(snapshot.lastResponse(), "");
+                }
+            }
+        }
+
+        return "";
+    }
+
+    private String extractEntityIdFromResponse(String responseBody, Map<String, EntityStoreService.ExtractedEntity> entitiesById) {
+        JsonNode root = parseJson(responseBody);
+        if (root != null) {
+            String id = extractFirstId(root, 0);
+            if (!id.isBlank()) {
+                return id;
+            }
+        }
+
+        for (String known : entitiesById.keySet()) {
+            if (responseBody != null && responseBody.contains("\"" + known + "\"")) {
+                return known;
+            }
+        }
+
+        return "";
+    }
+
+    private String extractFirstId(JsonNode node, int depth) {
+        if (node == null || node.isNull() || node.isMissingNode() || depth > 8) {
             return "";
         }
 
         if (node.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                String key = entry.getKey().toLowerCase(Locale.ROOT);
-                if ("typename".equals(key) || "type".equals(key) || "entitytype".equals(key)) {
-                    String value = entry.getValue().asText("").trim();
-                    if (!value.isBlank()) {
-                        return value;
-                    }
-                }
+            String directId = asText(node.get("id"));
+            if (!directId.isBlank()) {
+                return directId;
             }
-
-            fields = node.fields();
+            java.util.Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
             while (fields.hasNext()) {
                 Map.Entry<String, JsonNode> entry = fields.next();
-                String nested = findTypeName(entry.getValue(), depth + 1);
+                String nested = extractFirstId(entry.getValue(), depth + 1);
                 if (!nested.isBlank()) {
                     return nested;
                 }
@@ -1316,8 +1828,8 @@ public final class AttackSuggestionService implements AutoCloseable {
         }
 
         if (node.isArray()) {
-            for (int i = 0; i < Math.min(node.size(), 6); i++) {
-                String nested = findTypeName(node.get(i), depth + 1);
+            for (JsonNode child : node) {
+                String nested = extractFirstId(child, depth + 1);
                 if (!nested.isBlank()) {
                     return nested;
                 }
@@ -1327,58 +1839,360 @@ public final class AttackSuggestionService implements AutoCloseable {
         return "";
     }
 
-    private List<String> findNestedMethods(String method, JsonNode params) {
-        if (method == null || method.isBlank()) {
-            return List.of();
-        }
-
-        boolean wrapper = "executemulticall".equalsIgnoreCase(method) || method.toLowerCase(Locale.ROOT).contains("multicall");
-        if (!wrapper && params != null && params.isObject()) {
-            boolean hasHints = false;
-            Iterator<String> names = params.fieldNames();
-            while (names.hasNext()) {
-                String key = names.next().toLowerCase(Locale.ROOT);
-                if ("calls".equals(key) || "requests".equals(key) || "operations".equals(key) || "methods".equals(key)) {
-                    hasHints = true;
-                    break;
+    private Map<String, Set<String>> buildMethodContextMap(List<JsonRpcIndex.MethodStoreView> methodStore) {
+        Map<String, Set<String>> map = new HashMap<>();
+        for (JsonRpcIndex.MethodStoreView view : methodStore) {
+            Set<String> contexts = map.computeIfAbsent(view.key(), ignored -> new LinkedHashSet<>());
+            for (String context : view.seenInSessions()) {
+                if (context != null && !context.isBlank()) {
+                    contexts.add(context);
                 }
             }
-            if (!hasHints) {
-                return List.of();
+        }
+        return map;
+    }
+
+    private Map<String, List<MethodDiffEvidence>> buildMethodDiffEvidence(
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, AuthContextStore.SessionView> contextsByKey
+    ) {
+        Map<String, List<MethodDiffEvidence>> map = new HashMap<>();
+
+        for (JsonRpcIndex.MethodStoreView view : methodStore) {
+            List<JsonRpcIndex.SessionSnapshot> snapshots = view.sessionSnapshots();
+            if (snapshots.size() < 2) {
+                continue;
+            }
+
+            for (int i = 0; i < snapshots.size(); i++) {
+                JsonRpcIndex.SessionSnapshot source = snapshots.get(i);
+                if (source.comparableRequestFingerprint() == null || source.comparableRequestFingerprint().isBlank()) {
+                    continue;
+                }
+
+                for (int j = i + 1; j < snapshots.size(); j++) {
+                    JsonRpcIndex.SessionSnapshot target = snapshots.get(j);
+                    if (!Objects.equals(source.comparableRequestFingerprint(), target.comparableRequestFingerprint())) {
+                        continue;
+                    }
+                    if (Objects.equals(source.responseHash(), target.responseHash())) {
+                        continue;
+                    }
+
+                    String reason = evaluateMethodDifference(source.lastResponse(), target.lastResponse(), view.key());
+                    if (reason.isBlank()) {
+                        continue;
+                    }
+
+                    String sourceContext = defaultIfBlank(source.sessionId(), "");
+                    String targetContext = defaultIfBlank(target.sessionId(), "");
+                    if (sourceContext.isBlank() || targetContext.isBlank()) {
+                        continue;
+                    }
+
+                    if (!contextsByKey.containsKey(sourceContext) || !contextsByKey.containsKey(targetContext)) {
+                        continue;
+                    }
+
+                    map.computeIfAbsent(view.key(), ignored -> new ArrayList<>())
+                            .add(new MethodDiffEvidence(
+                                    view.key(),
+                                    sourceContext,
+                                    targetContext,
+                                    reason,
+                                    defaultIfBlank(source.lastResponse(), ""),
+                                    defaultIfBlank(target.lastResponse(), "")
+                            ));
+
+                    map.computeIfAbsent(view.key(), ignored -> new ArrayList<>())
+                            .add(new MethodDiffEvidence(
+                                    view.key(),
+                                    targetContext,
+                                    sourceContext,
+                                    reason,
+                                    defaultIfBlank(target.lastResponse(), ""),
+                                    defaultIfBlank(source.lastResponse(), "")
+                            ));
+                }
             }
         }
 
-        LinkedHashSet<String> nested = new LinkedHashSet<>();
-        collectNestedMethods(params, nested, 0);
-        nested.remove(method);
-        return List.copyOf(nested);
+        return map;
     }
 
-    private void collectNestedMethods(JsonNode node, Set<String> out, int depth) {
-        if (node == null || node.isNull() || node.isMissingNode() || depth > 8) {
+    private Map<String, Set<String>> buildEntityContextMap(Map<String, EntityStoreService.ExtractedEntity> entitiesById) {
+        Map<String, Set<String>> map = new HashMap<>();
+        for (Map.Entry<String, EntityStoreService.ExtractedEntity> entry : entitiesById.entrySet()) {
+            EntityStoreService.ExtractedEntity entity = entry.getValue();
+            LinkedHashSet<String> contexts = new LinkedHashSet<>();
+            if (entity.contextKey() != null && !entity.contextKey().isBlank()) {
+                contexts.add(entity.contextKey());
+            }
+            for (String context : entity.seenInContexts()) {
+                if (context != null && !context.isBlank()) {
+                    contexts.add(context);
+                }
+            }
+            map.put(entry.getKey(), contexts);
+        }
+        return map;
+    }
+
+    private String evaluateMethodDifference(String sourceResponse, String targetResponse, String methodKey) {
+        if ((sourceResponse == null || sourceResponse.isBlank()) && (targetResponse == null || targetResponse.isBlank())) {
+            return "";
+        }
+
+        String left = defaultIfBlank(sourceResponse, "");
+        String right = defaultIfBlank(targetResponse, "");
+        if (left.equals(right)) {
+            return "";
+        }
+
+        JsonNode leftJson = parseJson(left);
+        JsonNode rightJson = parseJson(right);
+
+        if (leftJson == null || rightJson == null) {
+            int delta = Math.abs(left.length() - right.length());
+            if (delta < 40) {
+                return "";
+            }
+            return "Response size differs by " + delta + " bytes for method " + defaultIfBlank(methodKey, "unknown");
+        }
+
+        Set<String> leftFields = new LinkedHashSet<>();
+        Set<String> rightFields = new LinkedHashSet<>();
+        collectFieldNames(leftJson, leftFields, 0);
+        collectFieldNames(rightJson, rightFields, 0);
+
+        Set<String> sourceOnly = new LinkedHashSet<>(leftFields);
+        sourceOnly.removeAll(rightFields);
+        Set<String> targetOnly = new LinkedHashSet<>(rightFields);
+        targetOnly.removeAll(leftFields);
+
+        int leftNodes = countNodes(leftJson, 0);
+        int rightNodes = countNodes(rightJson, 0);
+        int nodeDelta = Math.abs(leftNodes - rightNodes);
+
+        List<String> signals = new ArrayList<>();
+        if (!sourceOnly.isEmpty()) {
+            signals.add("source-only fields=" + sourceOnly.stream().limit(6).toList());
+        }
+        if (!targetOnly.isEmpty()) {
+            signals.add("target-only fields=" + targetOnly.stream().limit(6).toList());
+        }
+        if (nodeDelta >= 6) {
+            signals.add("JSON node count differs: source=" + leftNodes + ", target=" + rightNodes);
+        }
+
+        JsonNode leftResult = leftJson.path("result");
+        JsonNode rightResult = rightJson.path("result");
+        if (leftResult.isArray() && rightResult.isArray() && leftResult.size() != rightResult.size()) {
+            signals.add("result[] size differs: source=" + leftResult.size() + ", target=" + rightResult.size());
+        }
+
+        if (signals.isEmpty()) {
+            return "";
+        }
+        return String.join("; ", signals);
+    }
+
+    private void collectFieldNames(JsonNode node, Set<String> out, int depth) {
+        if (node == null || node.isNull() || node.isMissingNode() || depth > 6) {
             return;
         }
 
         if (node.isObject()) {
-            JsonNode methodNode = node.get("method");
-            if (methodNode != null && !methodNode.isNull()) {
-                String method = methodNode.isTextual() ? methodNode.asText("") : methodNode.toString();
-                if (!method.isBlank()) {
-                    out.add(method);
-                }
-            }
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            java.util.Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
             while (fields.hasNext()) {
-                collectNestedMethods(fields.next().getValue(), out, depth + 1);
+                Map.Entry<String, JsonNode> entry = fields.next();
+                out.add(entry.getKey());
+                collectFieldNames(entry.getValue(), out, depth + 1);
             }
             return;
         }
 
         if (node.isArray()) {
-            for (JsonNode item : node) {
-                collectNestedMethods(item, out, depth + 1);
+            int limit = Math.min(node.size(), 8);
+            for (int i = 0; i < limit; i++) {
+                collectFieldNames(node.get(i), out, depth + 1);
             }
         }
+    }
+
+    private int countNodes(JsonNode node, int depth) {
+        if (node == null || node.isNull() || node.isMissingNode() || depth > 12) {
+            return 0;
+        }
+
+        int total = 1;
+        if (node.isObject()) {
+            java.util.Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext()) {
+                total += countNodes(fields.next().getValue(), depth + 1);
+            }
+        } else if (node.isArray()) {
+            int limit = Math.min(node.size(), 20);
+            for (int i = 0; i < limit; i++) {
+                total += countNodes(node.get(i), depth + 1);
+            }
+        }
+        return total;
+    }
+
+    private String findMethodDifference(
+            Map<String, List<MethodDiffEvidence>> methodDiffEvidence,
+            String methodKey,
+            String sourceContext,
+            String targetContext,
+            String sourceResponse,
+            String targetResponse
+    ) {
+        for (MethodDiffEvidence evidence : methodDiffEvidence.getOrDefault(methodKey, List.of())) {
+            if (Objects.equals(evidence.sourceContext(), sourceContext)
+                    && Objects.equals(evidence.targetContext(), targetContext)) {
+                return defaultIfBlank(evidence.reason(), "");
+            }
+        }
+        return evaluateMethodDifference(sourceResponse, targetResponse, methodKey);
+    }
+
+    private String pickSourceContext(
+            Set<String> contexts,
+            String targetContext,
+            Map<String, AuthContextStore.SessionView> contextsByKey
+    ) {
+        if (contexts == null || contexts.isEmpty()) {
+            return "";
+        }
+
+        for (String context : contexts) {
+            if (Objects.equals(context, targetContext)) {
+                continue;
+            }
+            if (roleFor(context, contextsByKey) == RoleType.ADMIN) {
+                return context;
+            }
+        }
+
+        for (String context : contexts) {
+            if (!Objects.equals(context, targetContext)) {
+                return context;
+            }
+        }
+
+        return "";
+    }
+
+    private String pickSourceContextForSubCalls(
+            List<String> subCallMethods,
+            Map<String, Set<String>> methodToContexts,
+            String targetContext,
+            Map<String, AuthContextStore.SessionView> contextsByKey
+    ) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        for (String subMethod : subCallMethods) {
+            if (subMethod == null || subMethod.isBlank()) {
+                continue;
+            }
+
+            for (Map.Entry<String, Set<String>> entry : methodToContexts.entrySet()) {
+                if (!entry.getKey().startsWith(subMethod + ":")) {
+                    continue;
+                }
+                candidates.addAll(entry.getValue());
+            }
+        }
+
+        return pickSourceContext(candidates, targetContext, contextsByKey);
+    }
+
+    private boolean hasAdminOnlySubType(
+            List<String> subTypeNames,
+            List<JsonRpcIndex.MethodStoreView> methodStore,
+            Map<String, AuthContextStore.SessionView> contextsByKey,
+            String currentContextKey
+    ) {
+        RoleType currentRole = roleFor(currentContextKey, contextsByKey);
+        if (currentRole == RoleType.ADMIN) {
+            return false;
+        }
+
+        for (String typeName : subTypeNames) {
+            if (typeName == null || typeName.isBlank()) {
+                continue;
+            }
+
+            boolean seen = false;
+            boolean onlyAdmin = true;
+            for (JsonRpcIndex.MethodStoreView view : methodStore) {
+                if (!typeName.equalsIgnoreCase(view.typeName())) {
+                    continue;
+                }
+                for (String contextKey : view.seenInSessions()) {
+                    seen = true;
+                    if (roleFor(contextKey, contextsByKey) != RoleType.ADMIN) {
+                        onlyAdmin = false;
+                    }
+                }
+            }
+
+            if (seen && onlyAdmin) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private String confidenceFor(
+            String targetContext,
+            String sourceContext,
+            Map<String, AuthContextStore.SessionView> contextsByKey
+    ) {
+        RoleType targetRole = roleFor(targetContext, contextsByKey);
+        RoleType sourceRole = roleFor(sourceContext, contextsByKey);
+        if (targetRole == RoleType.LOW_PRIV && sourceRole == RoleType.ADMIN) {
+            return "HIGH";
+        }
+        if (targetRole == RoleType.LOW_PRIV && sourceRole != RoleType.LOW_PRIV) {
+            return "HIGH";
+        }
+        if (targetRole == RoleType.LOW_PRIV || sourceRole == RoleType.ADMIN) {
+            return "MEDIUM";
+        }
+        if (targetRole != sourceRole && targetRole != RoleType.UNKNOWN) {
+            return "MEDIUM";
+        }
+        // Both UNKNOWN: pre-tagging discovery — generate findings at reduced confidence
+        // so the extension isn't silent until roles are manually tagged.
+        if (targetRole == RoleType.UNKNOWN || sourceRole == RoleType.UNKNOWN) {
+            return "MEDIUM";
+        }
+        return "LOW";
+    }
+
+    private RoleType roleFor(String contextKey, Map<String, AuthContextStore.SessionView> contextsByKey) {
+        if (contextKey == null || contextKey.isBlank()) {
+            return RoleType.UNKNOWN;
+        }
+        AuthContextStore.SessionView session = contextsByKey.get(contextKey);
+        return session == null ? RoleType.UNKNOWN : session.role();
+    }
+
+    private boolean isWriteLikeMethod(String methodName) {
+        String lowered = methodName == null ? "" : methodName.toLowerCase(Locale.ROOT);
+        return lowered.startsWith("set")
+                || lowered.startsWith("add")
+                || lowered.startsWith("create")
+                || lowered.startsWith("update")
+                || lowered.startsWith("delete")
+                || lowered.startsWith("remove")
+                || lowered.startsWith("assign")
+                || lowered.startsWith("grant")
+                || lowered.contains("save")
+                || lowered.contains("write")
+                || lowered.contains("edit");
     }
 
     private JsonNode parseJson(String text) {
@@ -1392,370 +2206,6 @@ public final class AttackSuggestionService implements AutoCloseable {
         }
     }
 
-    private ResponseSnapshot summarizeResponse(Integer statusCode, JsonNode responseNode, String rawBody) {
-        int bodyLength = rawBody == null ? 0 : rawBody.length();
-        if (responseNode == null) {
-            boolean error = rawBody != null && rawBody.toLowerCase(Locale.ROOT).contains("error");
-            return new ResponseSnapshot(statusCode, 0, 0, bodyLength, error,
-                    statusCode != null && statusCode >= 200 && statusCode < 300);
-        }
-
-        JsonNode resultNode = responseNode;
-        if (responseNode.isObject()) {
-            JsonNode result = responseNode.path("result");
-            if (!result.isMissingNode() && !result.isNull()) {
-                resultNode = result;
-            }
-        }
-
-        int objectCount = estimateObjectCount(resultNode);
-        int fieldCount = estimateFieldCount(resultNode, 0, 4, 80);
-        boolean hasError = false;
-        if (responseNode.isObject()) {
-            JsonNode errorNode = responseNode.path("error");
-            hasError = !errorNode.isMissingNode() && !errorNode.isNull();
-        }
-
-        return new ResponseSnapshot(
-                statusCode,
-                objectCount,
-                fieldCount,
-                bodyLength,
-                hasError,
-                statusCode != null && statusCode >= 200 && statusCode < 300
-        );
-    }
-
-    private int estimateObjectCount(JsonNode node) {
-        if (node == null || node.isNull() || node.isMissingNode()) {
-            return 0;
-        }
-        if (node.isArray()) {
-            return node.size();
-        }
-        if (node.isObject()) {
-            return node.size() == 0 ? 0 : 1;
-        }
-        return 1;
-    }
-
-    private int estimateFieldCount(JsonNode node, int depth, int maxDepth, int maxFields) {
-        if (node == null || node.isNull() || node.isMissingNode() || depth > maxDepth || maxFields <= 0) {
-            return 0;
-        }
-
-        if (node.isObject()) {
-            int count = 0;
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext() && count < maxFields) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                count++;
-                count += estimateFieldCount(entry.getValue(), depth + 1, maxDepth, maxFields - count);
-            }
-            return Math.min(count, maxFields);
-        }
-
-        if (node.isArray()) {
-            int count = 1;
-            int maxItems = Math.min(node.size(), 3);
-            for (int i = 0; i < maxItems && count < maxFields; i++) {
-                count += estimateFieldCount(node.get(i), depth + 1, maxDepth, maxFields - count);
-            }
-            return Math.min(count, maxFields);
-        }
-
-        return 1;
-    }
-
-    private TenantSnapshot buildTenantSnapshot(JsonNode paramsNode, JsonNode responseNode, AuthContextStore.AuthContext auth) {
-        Set<String> tenantValues = new LinkedHashSet<>();
-        collectTenantValues(paramsNode, tenantValues, 0);
-        collectTenantValues(responseNode, tenantValues, 0);
-
-        return new TenantSnapshot(
-                fallbackValue(findFirstByKey(paramsNode, Set.of("database", "db", "databaseName")), auth.database()),
-                fallbackValue(findFirstByKey(paramsNode, Set.of("sessionId", "session", "sid")), auth.sessionId()),
-                fallbackValue(findFirstByKey(paramsNode, Set.of("userName", "username", "user")), auth.userName()),
-                List.copyOf(tenantValues)
-        );
-    }
-
-    private EntitySnapshot buildEntitySnapshot(JsonNode paramsNode, JsonNode responseNode, AuthContextStore.AuthContext auth) {
-        Map<String, String> ids = new LinkedHashMap<>();
-        Map<String, String> requestIds = new LinkedHashMap<>();
-        Map<String, String> responseIds = new LinkedHashMap<>();
-        Set<String> allValues = new LinkedHashSet<>();
-        Set<String> responseValues = new LinkedHashSet<>();
-        Set<String> tenantLinked = new LinkedHashSet<>();
-
-        collectEntityValues(paramsNode, ids, requestIds, allValues, tenantLinked, false, 0);
-        collectEntityValues(responseNode, ids, responseIds, allValues, tenantLinked, true, 0);
-        collectDirectCredential(auth, ids, requestIds, allValues, tenantLinked);
-
-        for (Map.Entry<String, String> entry : ids.entrySet()) {
-            if (isTenantLinkedKey(entry.getKey())) {
-                tenantLinked.add(entry.getValue());
-            }
-        }
-
-        collectResponseEntityValues(responseNode, responseValues, 0);
-
-        return new EntitySnapshot(
-                ids,
-            requestIds,
-            responseIds,
-                List.copyOf(allValues),
-                List.copyOf(responseValues),
-                List.copyOf(tenantLinked)
-        );
-    }
-
-    private void collectDirectCredential(
-            AuthContextStore.AuthContext auth,
-            Map<String, String> ids,
-            Map<String, String> requestIds,
-            Set<String> allValues,
-            Set<String> tenantLinked
-    ) {
-        putIfPresent(ids, requestIds, allValues, tenantLinked, "database", auth.database(), true);
-        putIfPresent(ids, requestIds, allValues, tenantLinked, "sessionId", auth.sessionId(), true);
-        putIfPresent(ids, requestIds, allValues, tenantLinked, "userName", auth.userName(), true);
-    }
-
-    private void collectEntityValues(
-            JsonNode node,
-            Map<String, String> ids,
-            Map<String, String> sourceIds,
-            Set<String> allValues,
-            Set<String> tenantLinked,
-            boolean response,
-            int depth
-    ) {
-        if (node == null || node.isNull() || node.isMissingNode() || depth > 8) {
-            return;
-        }
-
-        if (node.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                String key = entry.getKey();
-                JsonNode value = entry.getValue();
-                if (value != null && value.isValueNode()) {
-                    String normalized = normalizeEntityValue(value);
-                    if (!normalized.isBlank() && isEntityKey(key)) {
-                        ids.putIfAbsent(key, normalized);
-                        sourceIds.putIfAbsent(key, normalized);
-                        allValues.add(normalized);
-                        if (isTenantLinkedKey(key)) {
-                            tenantLinked.add(normalized);
-                        }
-                    }
-                }
-                collectEntityValues(value, ids, sourceIds, allValues, tenantLinked, response, depth + 1);
-            }
-            return;
-        }
-
-        if (node.isArray()) {
-            for (JsonNode item : node) {
-                collectEntityValues(item, ids, sourceIds, allValues, tenantLinked, response, depth + 1);
-            }
-        }
-    }
-
-    private void collectResponseEntityValues(JsonNode node, Set<String> responseValues, int depth) {
-        if (node == null || node.isNull() || node.isMissingNode() || depth > 8) {
-            return;
-        }
-
-        if (node.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                if (entry.getValue().isValueNode() && isEntityKey(entry.getKey())) {
-                    String value = normalizeEntityValue(entry.getValue());
-                    if (!value.isBlank()) {
-                        responseValues.add(value);
-                    }
-                }
-                collectResponseEntityValues(entry.getValue(), responseValues, depth + 1);
-            }
-            return;
-        }
-
-        if (node.isArray()) {
-            for (JsonNode item : node) {
-                collectResponseEntityValues(item, responseValues, depth + 1);
-            }
-        }
-    }
-
-    private MethodClassification classifyMethod(
-            CallView call,
-            ResponseSnapshot responseSnapshot,
-            TenantSnapshot tenant,
-            EntitySnapshot entity
-    ) {
-        boolean wrapper = call.batchRequest() || !call.nestedMethods().isEmpty();
-        boolean notificationCapable = call.notificationRequest() || call.callNode().has("id");
-        boolean hasRequestEntities = !entity.requestIds().isEmpty();
-        boolean responseRich = responseSnapshot.objectCount() > 0 || responseSnapshot.fieldCount() > 2;
-
-        boolean writeLike = !wrapper
-                && hasRequestEntities
-                && responseSnapshot.isSuccess()
-                && !responseSnapshot.hasError()
-                && responseSnapshot.objectCount() <= 1;
-
-        boolean metaTelemetry = !wrapper
-                && !hasRequestEntities
-                && !responseRich
-                && tenant.tenantValues().isEmpty()
-                && !responseSnapshot.hasError();
-
-        MethodMode mode = wrapper
-                ? MethodMode.WRAPPER
-                : (writeLike
-                ? MethodMode.WRITE
-                : (responseRich
-                ? MethodMode.READ
-                : (metaTelemetry ? MethodMode.META_TELEMETRY : MethodMode.UNKNOWN)));
-
-        boolean adminSensitive = !entity.tenantLinkedValues().isEmpty()
-                || !tenant.tenantValues().isEmpty()
-                || (mode == MethodMode.WRITE && responseSnapshot.isSuccess());
-
-        return new MethodClassification(mode, adminSensitive, wrapper, notificationCapable, metaTelemetry);
-    }
-
-    private MethodContext reclassifyMethodContext(List<ObservedItem> items, int methodRisk, ContextPair pair) {
-        if (items == null || items.isEmpty()) {
-            return new MethodContext(MethodMode.UNKNOWN, false, false, false, false, "");
-        }
-
-        boolean wrapperObserved = false;
-        boolean notificationObserved = false;
-        boolean requestEntitiesObserved = false;
-        boolean responseRichObserved = false;
-        boolean tenantAware = false;
-        boolean lowPrivSuccess = false;
-        boolean writeLike = false;
-        boolean metaTelemetryCandidate = true;
-        String typeName = "";
-
-        for (ObservedItem item : items) {
-            if (typeName.isBlank() && item.typeName() != null && !item.typeName().isBlank()) {
-                typeName = item.typeName();
-            }
-
-            boolean hasRequestEntities = !item.entityContext().requestIds().isEmpty();
-            boolean responseRich = item.responseSnapshot().objectCount() > 0 || item.responseSnapshot().fieldCount() > 2;
-
-            wrapperObserved = wrapperObserved
-                    || item.rpcContext().batchRequest()
-                    || item.methodContext().wrapper()
-                    || !item.rpcContext().nestedMethods().isEmpty();
-                boolean requestContainsJsonRpcId = item.httpRequestRaw() != null
-                    && item.httpRequestRaw().contains("\"id\"");
-                notificationObserved = notificationObserved
-                    || item.rpcContext().notificationRequest()
-                    || requestContainsJsonRpcId;
-            requestEntitiesObserved = requestEntitiesObserved || hasRequestEntities;
-            responseRichObserved = responseRichObserved || responseRich;
-
-            tenantAware = tenantAware
-                    || !item.tenantContext().tenantValues().isEmpty()
-                    || !item.entityContext().tenantLinkedValues().isEmpty();
-
-            if (item.authContext().role() == RoleType.LOW_PRIV
-                    && item.responseSnapshot().isSuccess()
-                    && !item.responseSnapshot().hasError()
-                    && hasRequestEntities) {
-                lowPrivSuccess = true;
-            }
-
-            if (item.responseSnapshot().isSuccess()
-                    && !item.responseSnapshot().hasError()
-                    && hasRequestEntities
-                    && item.responseSnapshot().objectCount() <= 1) {
-                writeLike = true;
-            }
-
-            if (hasRequestEntities || responseRich || tenantAware || item.responseSnapshot().hasError()) {
-                metaTelemetryCandidate = false;
-            }
-        }
-
-        boolean roleDifference = pair != null
-                && pair.highContextItem() != null
-                && pair.lowContextItem() != null
-                && pair.highContextItem().authContext().role() != pair.lowContextItem().authContext().role();
-
-        if (wrapperObserved && requestEntitiesObserved && (tenantAware || lowPrivSuccess)) {
-            writeLike = true;
-        }
-
-        MethodMode mode = wrapperObserved
-                ? MethodMode.WRAPPER
-                : (writeLike
-                ? MethodMode.WRITE
-                : (responseRichObserved
-                ? MethodMode.READ
-                : (metaTelemetryCandidate ? MethodMode.META_TELEMETRY : MethodMode.UNKNOWN)));
-
-        boolean adminSensitive = tenantAware
-                || roleDifference
-                || methodRisk >= 70
-                || (mode == MethodMode.WRITE && lowPrivSuccess);
-
-        return new MethodContext(
-                mode,
-                adminSensitive,
-                wrapperObserved,
-                notificationObserved,
-                mode == MethodMode.META_TELEMETRY,
-                typeName
-        );
-    }
-
-    private Map<String, Integer> buildChainEdgeCounts(WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot) {
-        Map<String, Integer> counts = new HashMap<>();
-        for (WorkflowGraphService.EdgeView edge : workflowSnapshot.edges()) {
-            counts.merge(edge.sourceMethod(), 1, Integer::sum);
-            counts.merge(edge.targetMethod(), 1, Integer::sum);
-        }
-        return counts;
-    }
-
-    private Map<String, Integer> buildChainCounts(WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot) {
-        Map<String, Integer> counts = new HashMap<>();
-        for (WorkflowGraphService.ChainView chain : workflowSnapshot.chains()) {
-            for (String method : chain.methodSequence()) {
-                counts.merge(method, 1, Integer::sum);
-            }
-        }
-        return counts;
-    }
-
-    private Map<String, String> buildPreferredChainPaths(WorkflowGraphService.WorkflowGraphSnapshot workflowSnapshot) {
-        Map<String, ChainChoice> choices = new HashMap<>();
-        for (WorkflowGraphService.ChainView chain : workflowSnapshot.chains()) {
-            for (String method : chain.methodSequence()) {
-                ChainChoice current = choices.get(method);
-                if (current == null || chain.score() > current.score()) {
-                    choices.put(method, new ChainChoice(chain.path(), chain.score()));
-                }
-            }
-        }
-
-        Map<String, String> result = new HashMap<>();
-        for (Map.Entry<String, ChainChoice> entry : choices.entrySet()) {
-            result.put(entry.getKey(), entry.getValue().path());
-        }
-        return result;
-    }
-
     private boolean isSuppressedMethod(String methodName) {
         String lowered = methodName == null ? "" : methodName.toLowerCase(Locale.ROOT);
         for (String term : SUPPRESSED_METHOD_TERMS) {
@@ -1766,214 +2216,105 @@ public final class AttackSuggestionService implements AutoCloseable {
         return false;
     }
 
-    private static boolean isEntityKey(String key) {
-        if (key == null || key.isBlank()) {
+    private static boolean isEntityKey(String loweredKey) {
+        if (loweredKey == null || loweredKey.isBlank()) {
             return false;
         }
-        String lowered = key.toLowerCase(Locale.ROOT);
-        return lowered.equals("id")
-                || lowered.endsWith("id")
-                || lowered.contains("_id")
-                || lowered.contains("device")
-                || lowered.contains("user")
-                || lowered.contains("group")
-                || lowered.contains("report")
-                || lowered.contains("schedule")
-                || lowered.contains("rule")
-                || lowered.contains("database")
-                || lowered.equals("db")
-                || lowered.contains("session")
-                || lowered.contains("tenant");
-    }
+        // Credential fields are not entity identifiers
+        if ("sessionid".equals(loweredKey) || "database".equals(loweredKey) || "username".equals(loweredKey)
+                || "date".equals(loweredKey)) {
+            return false;
+        }
 
-    private static boolean isTenantLinkedKey(String key) {
-        if (key == null || key.isBlank()) {
-            return false;
-        }
-        String lowered = key.toLowerCase(Locale.ROOT);
-        if (TENANT_KEYS.contains(lowered)) {
+        // Exact match for bare "id"
+        if ("id".equals(loweredKey)) {
             return true;
         }
-        return lowered.contains("tenant")
-                || lowered.contains("database")
-                || lowered.contains("group")
-                || lowered.contains("company");
-    }
 
-    private String normalizeEntityValue(JsonNode node) {
-        if (node == null || node.isNull()) {
-            return "";
-        }
-        String value = node.asText("").trim();
-        if (value.isBlank()) {
-            return "";
-        }
-        if (value.length() > 120) {
-            return value.substring(0, 120);
-        }
-        return value;
-    }
-
-    private void collectTenantValues(JsonNode node, Set<String> out, int depth) {
-        if (node == null || node.isNull() || node.isMissingNode() || depth > 8) {
-            return;
-        }
-
-        if (node.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                if (isTenantLinkedKey(entry.getKey()) && entry.getValue().isValueNode()) {
-                    String value = normalizeEntityValue(entry.getValue());
-                    if (!value.isBlank()) {
-                        out.add(value);
-                    }
-                }
-                collectTenantValues(entry.getValue(), out, depth + 1);
-            }
-            return;
-        }
-
-        if (node.isArray()) {
-            for (JsonNode item : node) {
-                collectTenantValues(item, out, depth + 1);
-            }
-        }
-    }
-
-    private String findFirstByKey(JsonNode node, Set<String> keys) {
-        if (node == null || node.isNull() || node.isMissingNode()) {
-            return "";
-        }
-
-        if (node.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                if (keys.contains(entry.getKey().toLowerCase(Locale.ROOT))) {
-                    String value = normalizeEntityValue(entry.getValue());
-                    if (!value.isBlank()) {
-                        return value;
-                    }
-                }
-                String nested = findFirstByKey(entry.getValue(), keys);
-                if (!nested.isBlank()) {
-                    return nested;
-                }
-            }
-            return "";
-        }
-
-        if (node.isArray()) {
-            for (JsonNode item : node) {
-                String nested = findFirstByKey(item, keys);
-                if (!nested.isBlank()) {
-                    return nested;
-                }
+        // Suffix-based ID detection — catches deviceId, userId, groupId, ruleId, etc.
+        // but NOT boolean filters like isDeviceCommunicating, isActive, hasPermission.
+        if (loweredKey.endsWith("id") && loweredKey.length() > 2) {
+            // Verify it's camelCase or snake_case ID, not a word ending in "id" like "valid", "hybrid"
+            char preceding = loweredKey.charAt(loweredKey.length() - 3);
+            if (preceding == '_' || Character.isLowerCase(preceding)) {
+                // Check the preceding segment looks like an entity type, not gibberish
+                return true;
             }
         }
 
-        return "";
-    }
-
-    private static void putIfPresent(
-            Map<String, String> ids,
-            Map<String, String> requestIds,
-            Set<String> allValues,
-            Set<String> tenantLinked,
-            String key,
-            String value,
-            boolean tenant
-    ) {
-        if (value == null || value.isBlank()) {
-            return;
-        }
-        ids.putIfAbsent(key, value);
-        requestIds.putIfAbsent(key, value);
-        allValues.add(value);
-        if (tenant) {
-            tenantLinked.add(value);
-        }
-    }
-
-    private String reasonFor(String baseReason, SignalSet signals) {
-        StringBuilder reason = new StringBuilder(baseReason);
-        reason.append(" Signals: ");
-        List<String> signalText = new ArrayList<>();
-        if (signals.authDifferenceDetected()) signalText.add("auth/response differential");
-        if (signals.responseRichnessMismatch()) signalText.add("response richness mismatch");
-        if (signals.idsReusedAcrossContexts()) signalText.add("ID reuse across contexts");
-        if (signals.tenantReplayable()) signalText.add("tenant/database value replayable");
-        if (signals.tenantOrDatabaseVisible()) signalText.add("tenant/database values visible");
-        if (signals.roleDifferenceSeen()) signalText.add("explicit role difference observed");
-        if (signals.lowPrivWriteSucceeded()) signalText.add("low-priv write success observed");
-        if (signals.batchMixPrivilege()) signalText.add("batch/multicall path");
-        if (signals.wrapperWriteReachable()) signalText.add("wrapper reaches write-like path");
-        if (signals.responsesExposeTenantObjects()) signalText.add("tenant-linked object exposure");
-        if (signals.chainConnected()) signalText.add("connected workflow chain evidence");
-        if (signalText.isEmpty()) signalText.add("captured request-shape mutation");
-        reason.append(String.join(", ", signalText));
-        return reason.toString();
-    }
-
-    private String evidenceFor(ObservedItem base, SignalSet signals, MethodContext methodContext, String chainPath) {
-        return evidenceFor(base, signals, methodContext, chainPath, null);
-    }
-
-    private String evidenceFor(ObservedItem base, SignalSet signals, MethodContext methodContext, String chainPath, ContextPair pair) {
-        StringBuilder evidence = new StringBuilder();
-        evidence.append("host=").append(base.host())
-                .append(", method=").append(base.methodName())
-                .append(", contextKey=").append(base.authContext().contextKey())
-                .append(", rpcVersion=").append(base.rpcContext().rpcVersion())
-                .append(", batch=").append(base.rpcContext().batchRequest())
-                .append(", notification=").append(base.rpcContext().notificationRequest())
-                .append(", paramsMode=").append(base.rpcContext().paramsMode())
-                .append(", methodMode=").append(methodContext.mode().name())
-                .append(", adminSensitive=").append(methodContext.adminSensitive())
-                .append(", database=").append(base.authContext().database())
-                .append(", sessionId=").append(shortValue(base.authContext().sessionId()))
-                .append(", userName=").append(base.authContext().userName())
-                .append(", role=").append(base.authContext().role().displayName())
-                .append(", ids=").append(String.join(",", firstValues(base.entityContext().allValues(), 8)))
-                .append(", authDiff=").append(signals.authDifferenceDetected())
-                .append(", richnessDiff=").append(signals.responseRichnessMismatch())
-                .append(", chainEdges=").append(signals.chainEdgeCount())
-                .append(", chainCount=").append(signals.chainCount())
-                .append(", chainPath=").append(defaultIfBlank(chainPath, base.methodName()));
-
-        // Include both involved contexts for actionable cross-tenant/cross-user evidence
-        if (pair != null && pair.highContextItem() != null && pair.lowContextItem() != null) {
-            ObservedItem highItem = pair.highContextItem();
-            ObservedItem lowItem = pair.lowContextItem();
-            evidence.append(" | INVOLVED CONTEXTS:")
-                    .append(" [HIGH] db=").append(highItem.authContext().database())
-                    .append(", user=").append(highItem.authContext().userName())
-                    .append(", role=").append(highItem.authContext().role().displayName())
-                    .append(", session=").append(shortValue(highItem.authContext().sessionId()))
-                    .append(" [LOW] db=").append(lowItem.authContext().database())
-                    .append(", user=").append(lowItem.authContext().userName())
-                    .append(", role=").append(lowItem.authContext().role().displayName())
-                    .append(", session=").append(shortValue(lowItem.authContext().sessionId()));
+        // Explicit underscore-based ID fields
+        if (loweredKey.contains("_id") || loweredKey.contains("_key")) {
+            return true;
         }
 
-        return evidence.toString();
+        // GroupCompanyId and similar compound identifiers
+        if (loweredKey.equals("groupcompanyid")) {
+            return true;
+        }
+
+        return false;
     }
 
-    private void logObservation(ObservedItem item) {
-        logging.logToOutput("[MyGeotab][rpc] host=" + item.host()
-                + " method=" + item.methodName()
-                + " nestedMethods=" + item.rpcContext().nestedMethods()
-                + " rpcVersion=" + item.rpcContext().rpcVersion()
-                + " batch=" + item.rpcContext().batchRequest()
-                + " notification=" + item.rpcContext().notificationRequest()
-                + " tenantDatabase=" + item.tenantContext().database()
-                + " sessionId=" + shortValue(item.tenantContext().sessionId())
-                + " userName=" + item.tenantContext().userName()
-                + " role=" + item.authContext().role().displayName()
-                + " contextKey=" + item.authContext().contextKey()
-                + " methodMode=" + item.methodContext().mode().name()
-                + " ids=" + firstValues(item.entityContext().allValues(), 6));
+    private String buildComparisonBlock(String adminResponse, String lowResponse) {
+        if ((adminResponse == null || adminResponse.isBlank()) && (lowResponse == null || lowResponse.isBlank())) {
+            return "";
+        }
+
+        String admin = truncate(defaultIfBlank(adminResponse, ""), 350);
+        String low = truncate(defaultIfBlank(lowResponse, ""), 350);
+        String structuralDiff = evaluateMethodDifference(adminResponse, lowResponse, "");
+        if (structuralDiff.isBlank()) {
+            return "adminResponse=" + admin + "\nlowPrivResponse=" + low;
+        }
+        return "adminResponse=" + admin + "\nlowPrivResponse=" + low + "\nstructuralDiff=" + structuralDiff;
+    }
+
+    private String classifyResponse(String responseBody) {
+        if (responseBody == null || responseBody.isBlank()) {
+            return "empty";
+        }
+
+        JsonNode root = parseJson(responseBody);
+        if (root == null) {
+            return "non_json";
+        }
+
+        JsonNode error = root.path("error");
+        if (!error.isMissingNode() && !error.isNull()) {
+            String message = asText(error.path("message")).toLowerCase(Locale.ROOT);
+            int code = error.path("code").asInt(0);
+            if (message.contains("forbidden") || message.contains("permission") || message.contains("unauthor")
+                    || message.contains("invaliduser") || code == 401 || code == 403) {
+                return "permission_error";
+            }
+            return "error";
+        }
+
+        JsonNode result = root.path("result");
+        if (result.isArray() && result.size() == 0) {
+            return "empty_result";
+        }
+        if (result.isObject() && result.size() == 0) {
+            return "empty_result";
+        }
+        if (!result.isMissingNode() && !result.isNull()) {
+            return "success_with_data";
+        }
+        return "success";
+    }
+
+    private String buildMethodKey(String method, String typeName) {
+        return defaultIfBlank(method, "Get") + ":" + defaultIfBlank(typeName, "Unknown");
+    }
+
+    private String methodFromKey(String methodKey) {
+        int index = methodKey.indexOf(':');
+        return index < 0 ? methodKey : methodKey.substring(0, index);
+    }
+
+    private String typeFromKey(String methodKey) {
+        int index = methodKey.indexOf(':');
+        return index < 0 ? "Unknown" : methodKey.substring(index + 1);
     }
 
     private void notifyListeners() {
@@ -1990,208 +2331,86 @@ public final class AttackSuggestionService implements AutoCloseable {
         return Integer.toHexString(Objects.hash(seed));
     }
 
-    private static String fallbackValue(String preferred, String fallback) {
-        return preferred == null || preferred.isBlank() ? safe(fallback) : preferred;
-    }
-
-    private static String safe(String value) {
-        return value == null ? "" : value;
+    private static String asText(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return "";
+        }
+        return node.asText("").trim();
     }
 
     private static String defaultIfBlank(String value, String fallback) {
         return value == null || value.isBlank() ? fallback : value;
     }
 
-    private static String shortValue(String value) {
-        if (value == null || value.isBlank()) {
+    private static String truncate(String value, int maxLength) {
+        if (value == null) {
             return "";
         }
-        return value.length() <= 24 ? value : value.substring(0, 24) + "...";
+        if (value.length() <= maxLength) {
+            return value;
+        }
+        return value.substring(0, maxLength);
     }
 
-    private static String firstValues(List<String> values, int max) {
-        if (values == null || values.isEmpty()) {
-            return "";
-        }
-        List<String> out = new ArrayList<>();
-        for (int i = 0; i < Math.min(max, values.size()); i++) {
-            out.add(values.get(i));
-        }
-        if (values.size() > max) {
-            out.add("+" + (values.size() - max));
-        }
-        return String.join("|", out);
-    }
-
-    private static int roleRank(RoleType roleType) {
-        if (roleType == null) {
-            return 1;
-        }
-        return switch (roleType) {
-            case ADMIN -> 3;
-            case UNKNOWN -> 2;
-            case LOW_PRIV -> 1;
-        };
-    }
-
-    private record ChainChoice(String path, long score) {
-    }
-
-    private record EntitySwapTarget(String fieldKey, String oldValue, String newValue) {
-        private static EntitySwapTarget empty() {
-            return new EntitySwapTarget("", "", "");
-        }
-
-        private boolean present() {
-            return fieldKey != null && !fieldKey.isBlank()
-                    && oldValue != null && !oldValue.isBlank()
-                    && newValue != null && !newValue.isBlank();
-        }
-    }
-
-    private record CallView(
-            int callIndex,
-            String methodName,
+    private record ParsedRequest(
+            String wrapperMethod,
             String typeName,
-            String rpcVersion,
-            boolean batchRequest,
-            boolean notificationRequest,
-            String paramsMode,
-            List<String> nestedMethods,
-            ObjectNode callNode,
-            JsonNode paramsNode
+            List<String> entityIds,
+            boolean multiCall,
+            boolean emptySearchInSubCall,
+            List<String> subCallTypeNames,
+            List<String> subCallMethods,
+            boolean hasWriteSubCall,
+            boolean hasMixedPrivilegeChain,
+            boolean notification,
+            boolean broadSearch
     ) {
     }
 
-    private record RpcContext(
-            String rpcVersion,
-            boolean batchRequest,
-            boolean notificationRequest,
-            String paramsMode,
-            List<String> nestedMethods,
-            int callIndex
+    private record MultiCallInfo(
+            boolean emptySearchInSubCall,
+            List<String> subCallTypeNames,
+            List<String> subCallMethods,
+            boolean hasWriteSubCall,
+            boolean hasMixedPrivilegeChain
     ) {
     }
 
-    private record AuthSnapshot(
-            String contextKey,
-            String database,
-            String sessionId,
-            String userName,
-            RoleType role
+    private record MethodDiffEvidence(
+            String methodKey,
+            String sourceContext,
+            String targetContext,
+            String reason,
+            String sourceResponse,
+            String targetResponse
     ) {
     }
 
-    private record TenantSnapshot(
-            String database,
-            String sessionId,
-            String userName,
-            List<String> tenantValues
-    ) {
-    }
-
-    private record MethodContext(
-            MethodMode mode,
-            boolean adminSensitive,
-            boolean wrapper,
-            boolean notificationCapable,
-            boolean metaTelemetry,
-            String typeName
-    ) {
-        boolean isWriteOrAdminSensitive() {
-            return mode == MethodMode.WRITE || adminSensitive;
-        }
-    }
-
-    private record MethodClassification(
-            MethodMode mode,
-            boolean adminSensitive,
-            boolean wrapper,
-            boolean notificationCapable,
-            boolean metaTelemetry
-    ) {
-    }
-
-    private enum MethodMode {
-        READ,
-        WRITE,
-        WRAPPER,
-        META_TELEMETRY,
-        UNKNOWN
-    }
-
-    private record EntitySnapshot(
-            Map<String, String> ids,
-            Map<String, String> requestIds,
-            Map<String, String> responseIds,
-            List<String> allValues,
-            List<String> responseValues,
-            List<String> tenantLinkedValues
-    ) {
-    }
-
-    private record ResponseSnapshot(
-            Integer statusCode,
-            int objectCount,
-            int fieldCount,
-            int bodyLength,
-            boolean hasError,
-            boolean success
-    ) {
-        boolean isSuccess() {
-            return success;
-        }
-    }
-
-    private record ObservedItem(
+    private record RequestObservation(
             String observationId,
             String recordId,
             Instant timestamp,
             String host,
-            String methodName,
+            String method,
+            String wrapperMethod,
             String typeName,
-            int callIndex,
-            String httpRequestRaw,
-            String httpResponseRaw,
-            RpcContext rpcContext,
-            AuthSnapshot authContext,
-            TenantSnapshot tenantContext,
-            MethodContext methodContext,
-            EntitySnapshot entityContext,
-            ResponseSnapshot responseSnapshot
+            String contextKey,
+            String sessionId,
+            String database,
+            String userName,
+            List<String> requestEntityIds,
+            boolean multiCall,
+            boolean emptySearchInSubCall,
+            List<String> subCallTypeNames,
+            List<String> subCallMethods,
+            boolean hasWriteSubCall,
+            boolean hasMixedPrivilegeChain,
+            String paramsMode,
+            boolean notification,
+            String requestBody,
+            String responseBody,
+            Integer responseStatus,
+            boolean broadSearch
     ) {
-    }
-
-    private record ContextPair(ObservedItem highContextItem, ObservedItem lowContextItem) {
-    }
-
-    private record SignalSet(
-            boolean authPairAvailable,
-            boolean authDifferenceDetected,
-            boolean responseRichnessMismatch,
-            boolean idsReusedAcrossContexts,
-            boolean tenantOrDatabaseVisible,
-            boolean tenantReplayable,
-            boolean lowPrivWriteSucceeded,
-            boolean batchMixPrivilege,
-            boolean wrapperWriteReachable,
-            boolean responsesExposeTenantObjects,
-            boolean roleDifferenceSeen,
-            boolean chainConnected,
-            int strongSignalCount,
-            int methodRiskScore,
-            int chainEdgeCount,
-            int chainCount
-    ) {
-        boolean provenSignal() {
-            // Allow through if we have a cross-database/cross-user pair with actionable signals
-            if (tenantReplayable && authPairAvailable) {
-                return true;
-            }
-            if (!chainConnected && !authPairAvailable) {
-                return false;
-            }
-            return strongSignalCount >= MIN_STRONG_SIGNALS_FOR_SUGGESTION;
-        }
     }
 }

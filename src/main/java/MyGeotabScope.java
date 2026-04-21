@@ -1,10 +1,11 @@
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
-import java.util.regex.Pattern;
 
 public final class MyGeotabScope {
-    private static final Pattern ALLOWED_HOST_PATTERN =
-            Pattern.compile("^(?:bugcrowd\\.geotab\\.com|bugcrowd(?:[5-9]|10|11)\\.geotab\\.com)$", Pattern.CASE_INSENSITIVE);
+    private static final String ALLOWED_HOSTS_PROPERTY = "logichunter.allowedHosts";
+    private static final String ALLOWED_HOSTS_ENV = "LOGICHUNTER_ALLOWED_HOSTS";
 
     private MyGeotabScope() {
     }
@@ -23,7 +24,18 @@ public final class MyGeotabScope {
             return false;
         }
 
-        return ALLOWED_HOST_PATTERN.matcher(normalizedHost).matches();
+        List<String> allowedHosts = configuredAllowedHosts();
+        if (allowedHosts.isEmpty()) {
+            return true;
+        }
+
+        for (String allowed : allowedHosts) {
+            if (hostMatchesRule(normalizedHost, allowed)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public static String extractHost(String url) {
@@ -56,5 +68,39 @@ public final class MyGeotabScope {
         }
 
         return normalized;
+    }
+
+    private static List<String> configuredAllowedHosts() {
+        String configured = System.getProperty(ALLOWED_HOSTS_PROPERTY, "");
+        if (configured.isBlank()) {
+            configured = System.getenv(ALLOWED_HOSTS_ENV);
+        }
+
+        if (configured == null || configured.isBlank()) {
+            return List.of();
+        }
+
+        String[] tokens = configured.split(",");
+        List<String> normalized = new ArrayList<>();
+        for (String token : tokens) {
+            String value = normalizeHost(token);
+            if (!value.isBlank()) {
+                normalized.add(value);
+            }
+        }
+        return normalized;
+    }
+
+    private static boolean hostMatchesRule(String host, String rule) {
+        if (host.equals(rule)) {
+            return true;
+        }
+
+        if (rule.startsWith("*.")) {
+            String suffix = rule.substring(1);
+            return !suffix.isBlank() && host.endsWith(suffix);
+        }
+
+        return false;
     }
 }

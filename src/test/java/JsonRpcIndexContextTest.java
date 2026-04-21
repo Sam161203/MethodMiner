@@ -17,7 +17,7 @@ class JsonRpcIndexContextTest {
         JsonRpcIndex index = new JsonRpcIndex();
 
         JsonRpcRecord admin = createRecord(
-                "https://bugcrowd5.geotab.com/apiv1",
+                "https://tenant-a.example.test/apiv1",
                 "sid-admin",
                 "db-admin",
                 "admin.user",
@@ -25,7 +25,7 @@ class JsonRpcIndexContextTest {
         );
 
         JsonRpcRecord low = createRecord(
-                "https://bugcrowd5.geotab.com/apiv1",
+                "https://tenant-a.example.test/apiv1",
                 "sid-low",
                 "db-low",
                 "low.user",
@@ -35,8 +35,8 @@ class JsonRpcIndexContextTest {
         JsonRpcNormalizedRecord adminNorm = parser.normalize(admin);
         JsonRpcNormalizedRecord lowNorm = parser.normalize(low);
 
-        index.addRecord(adminNorm, admin, "host=bugcrowd5.geotab.com|db=db-admin|sid=sid-admin|user=admin.user");
-        index.addRecord(lowNorm, low, "host=bugcrowd5.geotab.com|db=db-low|sid=sid-low|user=low.user");
+        index.addRecord(adminNorm, admin, "host=tenant-a.example.test|db=db-admin|sid=sid-admin|user=admin.user");
+        index.addRecord(lowNorm, low, "host=tenant-a.example.test|db=db-low|sid=sid-low|user=low.user");
 
         List<JsonRpcIndex.ContextRow> contextRows = index.snapshotContextRows();
         assertEquals(2, contextRows.size());
@@ -70,7 +70,7 @@ class JsonRpcIndexContextTest {
                 + "}";
 
         String rawRequest = "POST /apiv1 HTTP/1.1\r\n"
-                + "Host: bugcrowd5.geotab.com\r\n"
+                + "Host: tenant-a.example.test\r\n"
                 + "Content-Type: application/json\r\n"
                 + "Cookie: sessionId=" + sessionId + "\r\n\r\n"
                 + requestBody;
@@ -79,7 +79,7 @@ class JsonRpcIndexContextTest {
                 url,
                 "POST",
                 List.of(
-                        "Host: bugcrowd5.geotab.com",
+                        "Host: tenant-a.example.test",
                         "Content-Type: application/json",
                         "Cookie: sessionId=" + sessionId
                 ),

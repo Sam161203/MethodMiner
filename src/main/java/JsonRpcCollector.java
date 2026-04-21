@@ -106,6 +106,9 @@ public final class JsonRpcCollector implements HttpHandler, AutoCloseable {
                         if (!MyGeotabScope.isAllowedUrl(record.request().url())) {
                             return;
                         }
+                        if (authContextStore.extractCredentials(record.request().bodyText()) == null) {
+                            return;
+                        }
                         JsonRpcNormalizedRecord normalizedRecord = parser.normalize(record);
                         AuthContextStore.AuthContext context = authContextStore.observeRecord(record, normalizedRecord.methodName());
                         index.addRecord(normalizedRecord, record, context.contextKey());
@@ -316,6 +319,11 @@ public final class JsonRpcCollector implements HttpHandler, AutoCloseable {
                 return;
             }
 
+            if (authContextStore.extractCredentials(record.request().bodyText()) == null) {
+                logSkip("missing-credentials", record.request().httpMethod(), record.request().url());
+                return;
+            }
+
             storageManager.appendRaw(record);
 
             List<JsonRpcNormalizedRecord> normalizedRecords = parser.normalizeAll(record);
@@ -328,7 +336,7 @@ public final class JsonRpcCollector implements HttpHandler, AutoCloseable {
                 AuthContextStore.AuthContext context = authContextStore.observeRecord(record, normalized.methodName());
                 String contextKey = context.contextKey();
                 logContext(context);
-                storageManager.appendNormalized(normalized);
+                storageManager.appendNormalized(normalized, record);
                 index.addRecord(normalized, record, contextKey);
                 logStore(contextKey, normalized.methodName());
                 notifyRecordListeners(record, normalized, false);

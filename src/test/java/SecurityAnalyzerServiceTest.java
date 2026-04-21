@@ -33,6 +33,7 @@ class SecurityAnalyzerServiceTest {
 
             JsonRpcNormalizedRecord normalized = parser.normalize(record);
             index.addRecord(normalized, record);
+            authContextStore.observeRecord(record, normalized.methodName());
             analyzer.ingestRecordSync(record, normalized);
 
             List<SecurityFinding> findings = analyzer.snapshotFindings();
@@ -57,7 +58,7 @@ class SecurityAnalyzerServiceTest {
                 "https://example.test/rpc",
                 "POST",
                 List.of("Host: example.test", "Cookie: sessionId=user-alpha"),
-                "{\"jsonrpc\":\"2.0\",\"method\":\"account.getProfile\",\"params\":{\"credentials\":{\"database\":\"db-alpha\",\"userName\":\"user-alpha\"},\"userId\":100},\"id\":1}",
+                "{\"jsonrpc\":\"2.0\",\"method\":\"account.getProfile\",\"params\":{\"credentials\":{\"database\":\"db-alpha\",\"sessionId\":\"user-alpha\",\"userName\":\"user-alpha\"},\"userId\":100},\"id\":1}",
                 200,
                 "{\"result\":{\"id\":100,\"role\":\"user\",\"permissions\":[\"read\"]},\"id\":1}"
             );
@@ -66,7 +67,7 @@ class SecurityAnalyzerServiceTest {
                 "https://example.test/rpc",
                 "POST",
                 List.of("Host: example.test", "Cookie: sessionId=admin-omega"),
-                "{\"jsonrpc\":\"2.0\",\"method\":\"account.getProfile\",\"params\":{\"credentials\":{\"database\":\"db-alpha\",\"userName\":\"admin-omega\"},\"userId\":100},\"id\":1}",
+                "{\"jsonrpc\":\"2.0\",\"method\":\"account.getProfile\",\"params\":{\"credentials\":{\"database\":\"db-alpha\",\"sessionId\":\"admin-omega\",\"userName\":\"admin-omega\"},\"userId\":100},\"id\":1}",
                 403,
                 "{\"error\":{\"code\":\"403\",\"message\":\"forbidden\",\"backendRoute\":\"/internal/admin/check\"},\"id\":1}"
             );
@@ -77,7 +78,9 @@ class SecurityAnalyzerServiceTest {
             index.addRecord(firstNorm, first);
             index.addRecord(secondNorm, second);
 
+            authContextStore.observeRecord(first, firstNorm.methodName());
             analyzer.ingestRecordSync(first, firstNorm);
+            authContextStore.observeRecord(second, secondNorm.methodName());
             analyzer.ingestRecordSync(second, secondNorm);
 
             authContextStore.setRoleForRecord(first.recordId(), RoleType.LOW_PRIV);

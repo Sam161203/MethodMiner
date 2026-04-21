@@ -1,11 +1,11 @@
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.net.URI;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -16,15 +16,14 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 public final class AuthContextStore {
-    private static final Set<String> DATABASE_KEYS = Set.of("database", "db", "dbName", "databaseName");
-    private static final Set<String> USER_KEYS = Set.of("user", "userName", "username", "email", "login");
-    private static final Set<String> SESSION_KEYS = Set.of("session", "sessionId", "sid", "token", "jwt");
-
     private final ObjectMapper objectMapper;
 
-    private final ConcurrentMap<String, AuthContext> contextStore = new ConcurrentHashMap<>();
+    // Context store key: host + database + sessionId + userName
+    private final ConcurrentMap<String, SessionState> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, RoleType> rolesByContextKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, String> recordToContextKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Set<String>> methodToContextKeys = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Set<String>> sessionIdToContextKeys = new ConcurrentHashMap<>();
     private final List<Runnable> updateListeners = new CopyOnWriteArrayList<>();
 
     public AuthContextStore(ObjectMapper objectMapper) {
@@ -37,68 +36,146 @@ public final class AuthContextStore {
         }
     }
 
+    public Credentials extractCredentials(String requestBody) {
+        JsonNode root = parseJson(requestBody);
+        if (root == null) {
+            return null;
+        }
+
+        if (root.isObject()) {
+            return extractFromCall(root);
+        }
+
+        if (root.isArray()) {
+            for (JsonNode item : root) {
+                if (item != null && item.isObject()) {
+                    Credentials credentials = extractFromCall(item);
+                    if (credentials != null) {
+                        return credentials;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
     public AuthContext observeRecord(JsonRpcRecord rawRecord, String methodName) {
         if (rawRecord == null) {
-            return AuthContext.unknown("unknown-context");
+            return AuthContext.unknown("unknown-session");
         }
 
-        JsonNode requestNode = parseJson(rawRecord.request().bodyText());
-        JsonNode responseNode = parseJson(rawRecord.response().bodyText());
+        Credentials credentials = extractCredentials(rawRecord.request().bodyText());
+        if (credentials == null || credentials.sessionId().isBlank()) {
+            return AuthContext.unknown("unknown-session");
+        }
 
-        String database = firstKnownValue(requestNode, responseNode, DATABASE_KEYS);
-        String userName = firstKnownValue(requestNode, responseNode, USER_KEYS);
-        String sessionId = firstKnownSession(rawRecord.request().headers(), requestNode, responseNode);
+        String sessionId = credentials.sessionId();
+        String host = defaultIfBlank(extractHost(rawRecord.request().url()), "unknown-host");
+        String database = defaultIfBlank(credentials.database(), "unknown-db");
+        String userName = defaultIfBlank(credentials.userName(), "unknown-user");
+        String contextKey = resolveCompatibleContextKey(host, database, sessionId, userName);
+        String typeName = defaultIfBlank(credentials.typeName(), "Unknown");
+        String method = defaultIfBlank(methodName, credentials.methodName());
+        Instant now = rawRecord.timestamp() == null ? Instant.now() : rawRecord.timestamp();
+        List<String> securityGroups = extractSecurityGroups(rawRecord.response().bodyText());
+        String lastSeenUrl = rawRecord.request().url() == null ? "" : rawRecord.request().url();
 
-        String normalizedDatabase = defaultIfBlank(database, "unknown-db");
-        String normalizedUser = defaultIfBlank(userName, "unknown-user");
-        String normalizedSession = defaultIfBlank(sessionId, "");
+        sessions.compute(contextKey, (ignored, existing) -> {
+            SessionState next = existing == null
+                    ? new SessionState(contextKey, host, sessionId, database, userName)
+                    : existing;
 
-        String authHeader = extractFullHeaderValue(rawRecord.request().headers(), "authorization");
-        String cookieHeader = extractFullHeaderValue(rawRecord.request().headers(), "cookie");
-        String requestUrl = safeValue(rawRecord.request().url());
+            if (!database.isBlank() && !"unknown-db".equals(database)) {
+                next.database = database;
+            }
+            if (!userName.isBlank() && !"unknown-user".equals(userName)) {
+                next.userName = userName;
+            }
+            if (!host.isBlank() && !"unknown-host".equals(host)) {
+                next.host = host;
+            }
 
-        String key = buildStableContextKey(
-                requestUrl,
-                rawRecord.request().headers(),
-                normalizedDatabase,
-                normalizedUser,
-                normalizedSession,
-                authHeader,
-                cookieHeader
-        );
+            next.lastSeen = now;
+            next.lastSeenUrl = lastSeenUrl;
+            next.requestCount = next.requestCount + 1;
+            next.role = rolesByContextKey.getOrDefault(contextKey, next.role);
+            for (String group : securityGroups) {
+                if (group != null && !group.isBlank()) {
+                    next.securityGroups.add(group.trim());
+                }
+            }
 
-        AuthContext context = contextStore.compute(key, (ignored, existing) -> {
-            RoleType role = existing == null ? RoleType.UNKNOWN : existing.role();
-            String sessionValue = normalizedSession.isBlank() && existing != null ? existing.sessionId() : normalizedSession;
-            String databaseValue = normalizedDatabase.equals("unknown-db") && existing != null ? existing.database() : normalizedDatabase;
-            String userValue = normalizedUser.equals("unknown-user") && existing != null ? existing.userName() : normalizedUser;
-            String authVal = authHeader.isBlank() && existing != null ? existing.rawAuthorizationHeader() : authHeader;
-            String cookieVal = cookieHeader.isBlank() && existing != null ? existing.rawCookieHeader() : cookieHeader;
-            String urlVal = requestUrl.isBlank() && existing != null ? existing.lastSeenUrl() : requestUrl;
-            return new AuthContext(key, databaseValue, sessionValue, userValue, role, authVal, cookieVal, urlVal);
+            return next;
         });
 
-        if (rawRecord.recordId() != null && !rawRecord.recordId().isBlank()) {
-            recordToContextKey.put(rawRecord.recordId(), key);
+        String recordId = rawRecord.recordId();
+        if (recordId != null && !recordId.isBlank()) {
+            recordToContextKey.put(recordId, contextKey);
+        }
+        sessionIdToContextKeys.computeIfAbsent(sessionId, ignored -> ConcurrentHashMap.newKeySet()).add(contextKey);
+
+        if (method != null && !method.isBlank()) {
+            String methodOnly = method;
+            String methodTypeKey = method + ":" + typeName;
+            methodToContextKeys.computeIfAbsent(methodOnly, ignored -> ConcurrentHashMap.newKeySet()).add(contextKey);
+            methodToContextKeys.computeIfAbsent(methodTypeKey, ignored -> ConcurrentHashMap.newKeySet()).add(contextKey);
         }
 
-        if (methodName != null && !methodName.isBlank()) {
-            methodToContextKeys.computeIfAbsent(methodName, ignored -> ConcurrentHashMap.newKeySet()).add(key);
+        notifyListeners();
+        return toAuthContext(sessions.get(contextKey));
+    }
+
+    public boolean setRole(String contextKeyOrSessionId, RoleType role) {
+        if (contextKeyOrSessionId == null || contextKeyOrSessionId.isBlank()) {
+            return false;
         }
 
-        return context;
+        RoleType nextRole = role == null ? RoleType.UNKNOWN : role;
+        SessionState updated = sessions.computeIfPresent(contextKeyOrSessionId, (ignored, existing) -> {
+            if (shouldBlockRoleOverwrite(existing.role, nextRole)) {
+                return existing;
+            }
+            applyRoleToState(existing.contextKey, existing, nextRole);
+            return existing;
+        });
+
+        if (updated == null) {
+            Set<String> contextKeys = sessionIdToContextKeys.get(contextKeyOrSessionId);
+            if (contextKeys == null || contextKeys.isEmpty()) {
+                return false;
+            }
+
+            boolean anyUpdated = false;
+            for (String contextKey : contextKeys) {
+                SessionState contextUpdated = sessions.computeIfPresent(contextKey, (ignored, existing) -> {
+                    if (shouldBlockRoleOverwrite(existing.role, nextRole)) {
+                        return existing;
+                    }
+                    applyRoleToState(existing.contextKey, existing, nextRole);
+                    return existing;
+                });
+                anyUpdated = anyUpdated || (contextUpdated != null && contextUpdated.role == nextRole);
+            }
+
+            if (!anyUpdated) {
+                return false;
+            }
+
+            notifyListeners();
+            return true;
+        }
+
+        notifyListeners();
+        return updated.role == nextRole;
     }
 
     public RoleType roleForRecordId(String recordId) {
         if (recordId == null || recordId.isBlank()) {
             return RoleType.UNKNOWN;
         }
-        String key = recordToContextKey.get(recordId);
-        if (key == null) {
-            return RoleType.UNKNOWN;
-        }
-        AuthContext context = contextStore.get(key);
-        return context == null ? RoleType.UNKNOWN : context.role();
+        String contextKey = recordToContextKey.get(recordId);
+        return roleForContextKey(contextKey);
     }
 
     public RoleType roleForMethod(String methodName) {
@@ -106,51 +183,83 @@ public final class AuthContextStore {
             return RoleType.UNKNOWN;
         }
 
-        Set<String> keys = methodToContextKeys.get(methodName);
-        if (keys == null || keys.isEmpty()) {
+        Set<String> contextKeys = methodToContextKeys.get(methodName);
+        if ((contextKeys == null || contextKeys.isEmpty()) && !methodName.contains(":")) {
+            List<String> collected = new ArrayList<>();
+            for (Map.Entry<String, Set<String>> entry : methodToContextKeys.entrySet()) {
+                if (entry.getKey().startsWith(methodName + ":")) {
+                    collected.addAll(entry.getValue());
+                }
+            }
+            contextKeys = Set.copyOf(collected);
+        }
+
+        if (contextKeys == null || contextKeys.isEmpty()) {
             return RoleType.UNKNOWN;
         }
 
-        RoleType resolved = null;
-        for (String key : keys) {
-            AuthContext context = contextStore.get(key);
-            if (context == null) {
-                continue;
-            }
-            RoleType role = context.role();
-            if (resolved == null) {
-                resolved = role;
-                continue;
-            }
-            if (resolved != role) {
-                return RoleType.UNKNOWN;
+        boolean hasAdmin = false;
+        boolean hasLowPriv = false;
+        boolean hasUnknown = false;
+        for (String contextKey : contextKeys) {
+            RoleType role = roleForContextKey(contextKey);
+            switch (role) {
+                case ADMIN -> hasAdmin = true;
+                case LOW_PRIV -> hasLowPriv = true;
+                case UNKNOWN -> hasUnknown = true;
+                default -> {
+                }
             }
         }
 
-        return resolved == null ? RoleType.UNKNOWN : resolved;
+        if (hasAdmin && hasLowPriv) {
+            return RoleType.MIXED;
+        }
+        if (hasAdmin) {
+            return RoleType.ADMIN;
+        }
+        if (hasLowPriv) {
+            return RoleType.LOW_PRIV;
+        }
+        return hasUnknown ? RoleType.UNKNOWN : RoleType.UNKNOWN;
     }
 
     public RoleType roleForContextKey(String contextKey) {
         if (contextKey == null || contextKey.isBlank()) {
             return RoleType.UNKNOWN;
         }
-        AuthContext context = contextStore.get(contextKey);
-        return context == null ? RoleType.UNKNOWN : context.role();
+        RoleType stored = rolesByContextKey.get(contextKey);
+        if (stored != null) {
+            return stored;
+        }
+        SessionState state = sessions.get(contextKey);
+        return state == null ? RoleType.UNKNOWN : state.role;
     }
 
+    // Compatibility method for existing UI call sites.
     public boolean setRoleForMethod(String methodName, RoleType roleType) {
         if (methodName == null || methodName.isBlank()) {
             return false;
         }
 
-        Set<String> keys = methodToContextKeys.get(methodName);
-        if (keys == null || keys.isEmpty()) {
+        Set<String> contextKeys = methodToContextKeys.get(methodName);
+        if ((contextKeys == null || contextKeys.isEmpty()) && !methodName.contains(":")) {
+            Set<String> merged = new LinkedHashSet<>();
+            for (Map.Entry<String, Set<String>> entry : methodToContextKeys.entrySet()) {
+                if (entry.getKey().startsWith(methodName + ":")) {
+                    merged.addAll(entry.getValue());
+                }
+            }
+            contextKeys = merged;
+        }
+
+        if (contextKeys == null || contextKeys.isEmpty()) {
             return false;
         }
 
         boolean updated = false;
-        for (String key : keys) {
-            updated = setRoleForContextKey(key, roleType) || updated;
+        for (String contextKey : contextKeys) {
+            updated = setRole(contextKey, roleType) || updated;
         }
         return updated;
     }
@@ -159,74 +268,365 @@ public final class AuthContextStore {
         if (methodName == null || methodName.isBlank()) {
             return List.of();
         }
-        Set<String> keys = methodToContextKeys.get(methodName);
-        if (keys == null || keys.isEmpty()) {
+
+        Set<String> exact = methodToContextKeys.get(methodName);
+        if (exact != null && !exact.isEmpty()) {
+            return List.copyOf(exact);
+        }
+
+        if (methodName.contains(":")) {
             return List.of();
         }
-        return List.copyOf(keys);
+
+        Set<String> merged = new LinkedHashSet<>();
+        for (Map.Entry<String, Set<String>> entry : methodToContextKeys.entrySet()) {
+            if (entry.getKey().startsWith(methodName + ":")) {
+                merged.addAll(entry.getValue());
+            }
+        }
+        return List.copyOf(merged);
     }
 
     public boolean setRoleForRecord(String recordId, RoleType roleType) {
         if (recordId == null || recordId.isBlank()) {
             return false;
         }
-        String key = recordToContextKey.get(recordId);
-        if (key == null) {
-            return false;
-        }
-        return setRoleForContextKey(key, roleType);
+        String contextKey = recordToContextKey.get(recordId);
+        return setRole(contextKey, roleType);
     }
 
     public boolean setRoleForContextKey(String contextKey, RoleType roleType) {
-        if (contextKey == null || contextKey.isBlank()) {
-            return false;
-        }
-
-        RoleType nextRole = roleType == null ? RoleType.UNKNOWN : roleType;
-        AuthContext updated = contextStore.computeIfPresent(contextKey, (ignored, existing) ->
-                new AuthContext(existing.contextKey(), existing.database(), existing.sessionId(), existing.userName(), nextRole,
-                        existing.rawAuthorizationHeader(), existing.rawCookieHeader(), existing.lastSeenUrl())
-        );
-
-        if (updated == null) {
-            return false;
-        }
-
-        notifyListeners();
-        return true;
+        return setRole(contextKey, roleType);
     }
 
     public String contextKeyForRecord(String recordId) {
         if (recordId == null || recordId.isBlank()) {
             return "";
         }
-        String key = recordToContextKey.get(recordId);
-        return key == null ? "" : key;
+        String contextKey = recordToContextKey.get(recordId);
+        return contextKey == null ? "" : contextKey;
+    }
+
+    /**
+     * Non-mutating context lookup — returns the current AuthContext for a request
+     * without incrementing counters, updating timestamps, or triggering listeners.
+     * Use this in downstream services that already had their record observed by the collector.
+     */
+    public AuthContext lookupContext(String requestBody, String requestUrl) {
+        Credentials credentials = extractCredentials(requestBody);
+        if (credentials == null || credentials.sessionId().isBlank()) {
+            return AuthContext.unknown("unknown-session");
+        }
+        String host = defaultIfBlank(extractHost(requestUrl), "unknown-host");
+        String database = defaultIfBlank(credentials.database(), "unknown-db");
+        String userName = defaultIfBlank(credentials.userName(), "unknown-user");
+        String contextKey = resolveCompatibleContextKey(host, database, credentials.sessionId(), userName);
+        SessionState state = sessions.get(contextKey);
+        if (state == null) {
+            return AuthContext.unknown("unknown-session");
+        }
+        return toAuthContext(state);
     }
 
     public List<AuthContext> snapshotContexts() {
-        List<AuthContext> contexts = new ArrayList<>(contextStore.values());
-        contexts.sort((left, right) -> left.contextKey().compareToIgnoreCase(right.contextKey()));
-        return contexts;
+        List<AuthContext> out = new ArrayList<>();
+        for (SessionState state : sessions.values()) {
+            out.add(toAuthContext(state));
+        }
+        out.sort(Comparator.comparing(AuthContext::lastSeen, Comparator.nullsLast(Comparator.reverseOrder())));
+        return out;
+    }
+
+    public List<SessionView> snapshotSessions() {
+        List<SessionView> out = new ArrayList<>();
+        for (SessionState state : sessions.values()) {
+            out.add(new SessionView(
+                    state.contextKey,
+                    state.sessionId,
+                    state.host,
+                    state.database,
+                    state.userName,
+                    state.role,
+                    state.lastSeen,
+                    state.requestCount,
+                    List.copyOf(state.securityGroups)
+            ));
+        }
+        out.sort(Comparator.comparing(SessionView::lastSeen, Comparator.nullsLast(Comparator.reverseOrder())));
+        return out;
     }
 
     public AuthContext firstContextByRole(RoleType role) {
         if (role == null) {
             return null;
         }
-        for (AuthContext ctx : contextStore.values()) {
-            if (ctx.role() == role) {
-                return ctx;
+
+        AuthContext selected = null;
+        for (SessionState state : sessions.values()) {
+            if (state.role != role) {
+                continue;
+            }
+            AuthContext candidate = toAuthContext(state);
+            if (selected == null) {
+                selected = candidate;
+                continue;
+            }
+            Instant selectedSeen = selected.lastSeen();
+            Instant candidateSeen = candidate.lastSeen();
+            if (selectedSeen == null || (candidateSeen != null && candidateSeen.isAfter(selectedSeen))) {
+                selected = candidate;
             }
         }
-        return null;
+        return selected;
     }
 
     public void clear() {
-        contextStore.clear();
+        sessions.clear();
+        rolesByContextKey.clear();
         recordToContextKey.clear();
         methodToContextKeys.clear();
+        sessionIdToContextKeys.clear();
         notifyListeners();
+    }
+
+    private String resolveCompatibleContextKey(String host, String database, String sessionId, String userName) {
+        String exact = buildContextKey(host, database, sessionId, userName);
+        if (sessions.containsKey(exact)) {
+            return exact;
+        }
+
+        List<String> contextKeys = new ArrayList<>(sessionIdToContextKeys.getOrDefault(sessionId, Set.of()));
+        List<SessionState> compatibleStates = new ArrayList<>();
+        String bestMatch = "";
+        int bestScore = Integer.MIN_VALUE;
+
+        for (String contextKey : contextKeys) {
+            SessionState state = sessions.get(contextKey);
+            if (state == null) {
+                continue;
+            }
+            if (!defaultIfBlank(state.host, "unknown-host").equals(defaultIfBlank(host, "unknown-host"))) {
+                continue;
+            }
+            if (!isCompatibleContextValue(database, state.database)) {
+                continue;
+            }
+            if (!isCompatibleContextValue(userName, state.userName)) {
+                continue;
+            }
+            compatibleStates.add(state);
+
+            int score = 0;
+            if (equalsIgnoreCaseSafe(database, state.database)) {
+                score += 3;
+            } else if (!isUnknownValue(database) && !isUnknownValue(state.database)) {
+                score -= 8;
+            }
+
+            if (equalsIgnoreCaseSafe(userName, state.userName)) {
+                score += 3;
+            } else if (!isUnknownValue(userName) && !isUnknownValue(state.userName)) {
+                score -= 8;
+            }
+
+            if (!isUnknownValue(state.database)) {
+                score += 1;
+            }
+            if (!isUnknownValue(state.userName)) {
+                score += 1;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = contextKey;
+            }
+        }
+
+        // Reconcile only partial-data contexts; never merge if multiple known candidates exist.
+        if (isUnknownValue(database) || isUnknownValue(userName)) {
+            boolean ambiguousDatabase = isUnknownValue(database)
+                    && countDistinctKnownValues(compatibleStates, true) > 1;
+            boolean ambiguousUser = isUnknownValue(userName)
+                    && countDistinctKnownValues(compatibleStates, false) > 1;
+            if (ambiguousDatabase || ambiguousUser) {
+                return exact;
+            }
+        }
+
+        return bestMatch.isBlank() ? exact : bestMatch;
+    }
+
+    private static int countDistinctKnownValues(List<SessionState> states, boolean databaseField) {
+        Set<String> known = new LinkedHashSet<>();
+        for (SessionState state : states) {
+            if (state == null) {
+                continue;
+            }
+            String value = databaseField ? state.database : state.userName;
+            if (isUnknownValue(value)) {
+                continue;
+            }
+            known.add(defaultIfBlank(value, "").trim().toLowerCase(Locale.ROOT));
+        }
+        return known.size();
+    }
+
+    private static boolean isCompatibleContextValue(String incoming, String existing) {
+        if (equalsIgnoreCaseSafe(incoming, existing)) {
+            return true;
+        }
+        return isUnknownValue(incoming) || isUnknownValue(existing);
+    }
+
+    private static boolean isUnknownValue(String value) {
+        String normalized = defaultIfBlank(value, "").trim().toLowerCase(Locale.ROOT);
+        return normalized.isBlank()
+                || "unknown".equals(normalized)
+                || "unknown-db".equals(normalized)
+                || "unknown-user".equals(normalized)
+                || "unknown-host".equals(normalized);
+    }
+
+    private static boolean equalsIgnoreCaseSafe(String left, String right) {
+        return defaultIfBlank(left, "").equalsIgnoreCase(defaultIfBlank(right, ""));
+    }
+
+    private static boolean shouldBlockRoleOverwrite(RoleType currentRole, RoleType nextRole) {
+        // Allow any role transition — users must be able to correct mistaken tags
+        // and switch between ADMIN / LOW_PRIV without a two-step UNKNOWN reset.
+        return false;
+    }
+
+    private void applyRoleToState(String contextKey, SessionState state, RoleType nextRole) {
+        state.role = nextRole;
+        if (nextRole == RoleType.UNKNOWN) {
+            rolesByContextKey.remove(contextKey);
+            return;
+        }
+        rolesByContextKey.put(contextKey, nextRole);
+    }
+
+    private Credentials extractFromCall(JsonNode callNode) {
+        if (callNode == null || !callNode.isObject()) {
+            return null;
+        }
+
+        JsonNode paramsNode = callNode.get("params");
+        if (paramsNode == null || paramsNode.isNull()) {
+            return null;
+        }
+
+        JsonNode credentialsNode = paramsNode.get("credentials");
+        if (credentialsNode == null || credentialsNode.isNull() || !credentialsNode.isObject()) {
+            return null;
+        }
+
+        String sessionId = asText(credentialsNode.get("sessionId"));
+        if (sessionId.isBlank()) {
+            return null;
+        }
+
+        String database = asText(credentialsNode.get("database"));
+        String userName = asText(credentialsNode.get("userName"));
+        String typeName = asText(paramsNode.get("typeName"));
+        String methodName = asText(callNode.get("method"));
+
+        return new Credentials(sessionId, database, userName, typeName, methodName);
+    }
+
+    private List<String> extractSecurityGroups(String responseBody) {
+        JsonNode response = parseJson(responseBody);
+        if (response == null) {
+            return List.of();
+        }
+
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        collectSecurityGroupsFromNode(response, out, 0);
+        return List.copyOf(out);
+    }
+
+    private void collectSecurityGroupsFromNode(JsonNode node, Set<String> out, int depth) {
+        if (node == null || node.isNull() || node.isMissingNode() || depth > 8 || out.size() >= 40) {
+            return;
+        }
+
+        if (node.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext() && out.size() < 40) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                String key = entry.getKey() == null ? "" : entry.getKey().toLowerCase(Locale.ROOT);
+                JsonNode value = entry.getValue();
+
+                if (key.contains("securitygroup") || key.equals("groups") || key.contains("group")) {
+                    collectGroupValue(value, out);
+                }
+
+                collectSecurityGroupsFromNode(value, out, depth + 1);
+            }
+            return;
+        }
+
+        if (node.isArray()) {
+            for (JsonNode item : node) {
+                collectSecurityGroupsFromNode(item, out, depth + 1);
+                if (out.size() >= 40) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private void collectGroupValue(JsonNode node, Set<String> out) {
+        if (node == null || node.isNull() || out.size() >= 40) {
+            return;
+        }
+
+        if (node.isTextual() || node.isNumber() || node.isBoolean()) {
+            String value = node.asText("").trim();
+            if (!value.isBlank()) {
+                out.add(value);
+            }
+            return;
+        }
+
+        if (node.isObject()) {
+            String id = asText(node.get("id"));
+            String name = asText(node.get("name"));
+            String joined = !name.isBlank() ? name : id;
+            if (!joined.isBlank()) {
+                out.add(joined);
+            }
+            return;
+        }
+
+        if (node.isArray()) {
+            for (JsonNode item : node) {
+                collectGroupValue(item, out);
+                if (out.size() >= 40) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private AuthContext toAuthContext(SessionState state) {
+        if (state == null) {
+            return AuthContext.unknown("unknown-session");
+        }
+
+        return new AuthContext(
+                state.contextKey,
+                defaultIfBlank(state.database, "unknown-db"),
+                state.sessionId,
+                defaultIfBlank(state.userName, "unknown-user"),
+                state.role,
+                "",
+                "",
+                defaultIfBlank(state.lastSeenUrl, ""),
+                state.lastSeen,
+                state.requestCount,
+                List.copyOf(state.securityGroups)
+        );
     }
 
     private void notifyListeners() {
@@ -234,7 +634,7 @@ public final class AuthContextStore {
             try {
                 listener.run();
             } catch (Exception ignored) {
-                // UI updates should not break processing.
+                // Listener failures should not interrupt ingestion.
             }
         }
     }
@@ -250,246 +650,78 @@ public final class AuthContextStore {
         }
     }
 
-    private static String firstKnownSession(List<String> headers, JsonNode requestNode, JsonNode responseNode) {
-        String fromHeaders = extractSessionFromHeaders(headers);
-        if (!fromHeaders.isBlank()) {
-            return fromHeaders;
-        }
-
-        String fromRequest = findFirstByKeys(requestNode, SESSION_KEYS);
-        if (!fromRequest.isBlank()) {
-            return fromRequest;
-        }
-
-        return findFirstByKeys(responseNode, SESSION_KEYS);
-    }
-
-    private static String extractSessionFromHeaders(List<String> headers) {
-        if (headers == null || headers.isEmpty()) {
-            return "";
-        }
-
-        for (String header : headers) {
-            if (header == null || header.isBlank()) {
-                continue;
-            }
-            String lowered = header.toLowerCase(Locale.ROOT);
-            if (lowered.startsWith("cookie:")) {
-                String value = header.substring(header.indexOf(':') + 1);
-                String[] segments = value.split(";");
-                for (String segment : segments) {
-                    String part = segment.trim();
-                    int equals = part.indexOf('=');
-                    if (equals < 1) {
-                        continue;
-                    }
-                    String key = part.substring(0, equals).trim().toLowerCase(Locale.ROOT);
-                    String val = part.substring(equals + 1).trim();
-                    if (key.contains("session") || key.equals("sid") || key.contains("token")) {
-                        return val;
-                    }
-                }
-            }
-
-            if (lowered.startsWith("authorization:")) {
-                String value = header.substring(header.indexOf(':') + 1).trim();
-                if (!value.isBlank()) {
-                    return value.length() > 120 ? value.substring(0, 120) : value;
-                }
-            }
-        }
-
-        return "";
-    }
-
-    private static String firstKnownValue(JsonNode requestNode, JsonNode responseNode, Set<String> keys) {
-        String request = findFirstByKeys(requestNode, keys);
-        if (!request.isBlank()) {
-            return request;
-        }
-        return findFirstByKeys(responseNode, keys);
-    }
-
-    private static String findFirstByKeys(JsonNode root, Set<String> candidateKeys) {
-        if (root == null) {
-            return "";
-        }
-
-        if (root.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = root.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                String fieldName = entry.getKey();
-                JsonNode value = entry.getValue();
-
-                for (String key : candidateKeys) {
-                    if (fieldName.equalsIgnoreCase(key)) {
-                        String resolved = leafValue(value);
-                        if (!resolved.isBlank()) {
-                            return resolved;
-                        }
-                    }
-                }
-
-                String nested = findFirstByKeys(value, candidateKeys);
-                if (!nested.isBlank()) {
-                    return nested;
-                }
-            }
-        }
-
-        if (root.isArray()) {
-            for (JsonNode item : root) {
-                String nested = findFirstByKeys(item, candidateKeys);
-                if (!nested.isBlank()) {
-                    return nested;
-                }
-            }
-        }
-
-        return "";
-    }
-
-    private static String leafValue(JsonNode node) {
+    private static String asText(JsonNode node) {
         if (node == null || node.isNull()) {
             return "";
         }
-        if (node.isTextual() || node.isNumber() || node.isBoolean()) {
-            String value = node.asText("");
-            return value.length() <= 120 ? value : value.substring(0, 120);
-        }
-        if (node.isArray() && node.size() > 0) {
-            return leafValue(node.get(0));
-        }
-        return "";
+        String value = node.asText("");
+        return value == null ? "" : value.trim();
     }
 
     private static String defaultIfBlank(String value, String fallback) {
         return value == null || value.isBlank() ? fallback : value;
     }
 
-    private static String safeValue(String value) {
-        return value == null ? "" : value;
-    }
-
-    private static String extractFullHeaderValue(List<String> headers, String headerName) {
-        if (headers == null || headers.isEmpty() || headerName == null) {
-            return "";
-        }
-        String prefix = headerName.toLowerCase(Locale.ROOT) + ":";
-        for (String header : headers) {
-            if (header != null && header.toLowerCase(Locale.ROOT).startsWith(prefix)) {
-                return header.substring(header.indexOf(':') + 1).trim();
-            }
-        }
-        return "";
-    }
-
-    private static String buildStableContextKey(
-            String requestUrl,
-            List<String> headers,
-            String database,
-            String userName,
-            String sessionId,
-            String authHeader,
-            String cookieHeader
-    ) {
-        String host = extractHost(requestUrl);
-        String db = normalizeKeyComponent(database, 80, "unknown-db");
-        String user = normalizeKeyComponent(userName, 80, "unknown-user");
-
-        // Context key uses only host + database + userName.
-        // SessionId, referer path, auth fingerprint, and cookie fingerprint are intentionally
-        // excluded: they change on re-login, page navigation, or cookie rotation, causing
-        // the same user to fragment into many contexts. The identity triple (host, db, user)
-        // is stable and unique per account session in the MyGeotab JSON-RPC API.
-        return "ctx"
-                + "|host=" + normalizeKeyComponent(host, 80, "unknown-host")
-                + "|db=" + db
-                + "|user=" + user;
-    }
-
-    private static String normalizeKeyComponent(String value, int maxLen, String fallback) {
-        if (value == null || value.isBlank()) {
-            return fallback;
-        }
-
-        String normalized = value.trim().toLowerCase(Locale.ROOT)
-                .replace('|', '_')
-                .replace('\n', ' ')
-                .replace('\r', ' ');
-
-        if (normalized.length() > maxLen) {
-            return normalized.substring(0, maxLen);
-        }
-        return normalized;
-    }
-
     private static String extractHost(String url) {
         if (url == null || url.isBlank()) {
             return "";
         }
-        try {
-            URI uri = URI.create(url);
-            return uri.getHost() == null ? "" : uri.getHost();
-        } catch (Exception ignored) {
-            return "";
+        return defaultIfBlank(MyGeotabScope.extractHost(url), "");
+    }
+
+    private static String buildContextKey(String host, String database, String sessionId, String userName) {
+        return "host=" + defaultIfBlank(host, "unknown-host")
+                + "|db=" + defaultIfBlank(database, "unknown-db")
+                + "|sid=" + defaultIfBlank(sessionId, "unknown-session")
+                + "|user=" + defaultIfBlank(userName, "unknown-user");
+    }
+
+    private static final class SessionState {
+        private final String contextKey;
+        private String host;
+        private final String sessionId;
+        private String database;
+        private String userName;
+        private RoleType role;
+        private Instant lastSeen;
+        private int requestCount;
+        private final LinkedHashSet<String> securityGroups;
+        private String lastSeenUrl;
+
+        private SessionState(String contextKey, String host, String sessionId, String database, String userName) {
+            this.contextKey = contextKey;
+            this.host = host;
+            this.sessionId = sessionId;
+            this.database = database;
+            this.userName = userName;
+            this.role = RoleType.UNKNOWN;
+            this.lastSeen = Instant.now();
+            this.requestCount = 0;
+            this.securityGroups = new LinkedHashSet<>();
+            this.lastSeenUrl = "";
         }
     }
 
-    private static String extractSourceContext(String requestUrl, List<String> headers) {
-        String referer = extractFullHeaderValue(headers, "referer");
-        if (!referer.isBlank()) {
-            String fromReferer = extractPath(referer);
-            if (!fromReferer.isBlank()) {
-                return fromReferer;
-            }
-        }
-
-        String requestPath = extractPath(requestUrl);
-        if (!requestPath.isBlank()) {
-            return requestPath;
-        }
-
-        return "unknown-src";
+    public record Credentials(
+            String sessionId,
+            String database,
+            String userName,
+            String typeName,
+            String methodName
+    ) {
     }
 
-    private static String extractPath(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return "";
-        }
-
-        if (raw.startsWith("/")) {
-            return raw;
-        }
-
-        try {
-            URI uri = URI.create(raw);
-            String path = uri.getPath();
-            if (path == null || path.isBlank()) {
-                path = "/";
-            }
-            if (uri.getQuery() != null && !uri.getQuery().isBlank()) {
-                path += "?" + uri.getQuery();
-            }
-            return path;
-        } catch (Exception ignored) {
-            return "";
-        }
-    }
-
-    private static String shortFingerprint(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder builder = new StringBuilder();
-            for (int i = 0; i < 8; i++) {
-                builder.append(String.format("%02x", hash[i]));
-            }
-            return builder.toString();
-        } catch (Exception ignored) {
-            return Integer.toHexString(value.hashCode());
-        }
+    public record SessionView(
+            String contextKey,
+            String sessionId,
+            String host,
+            String database,
+            String userName,
+            RoleType role,
+            Instant lastSeen,
+            int requestCount,
+            List<String> securityGroups
+    ) {
     }
 
     public record AuthContext(
@@ -500,10 +732,14 @@ public final class AuthContextStore {
             RoleType role,
             String rawAuthorizationHeader,
             String rawCookieHeader,
-            String lastSeenUrl
+            String lastSeenUrl,
+            Instant lastSeen,
+            int requestCount,
+            List<String> securityGroups
     ) {
         public static AuthContext unknown(String key) {
-            return new AuthContext(key, "unknown-db", "", "unknown-user", RoleType.UNKNOWN, "", "", "");
+            return new AuthContext(key, "unknown-db", "", "unknown-user", RoleType.UNKNOWN,
+                    "", "", "", Instant.now(), 0, List.of());
         }
     }
 }

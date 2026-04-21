@@ -1,15 +1,20 @@
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 
 /**
- * Utility for building copy-paste-ready exploit payloads with real session data.
- * Produces formatted HTTP requests, cURL commands, and raw payloads.
+ * Utility for building copy-paste-ready payloads with body credentials.
+ * Output is intentionally header-clean: no Authorization/Cookie headers are emitted.
  */
 public final class CopyablePayloadBuilder {
-    private CopyablePayloadBuilder() {}
+    private static final String DEFAULT_HOST = "example.com";
+    private static final String DEFAULT_PATH = "/jsonrpc";
 
-    /**
-     * Wraps a JSON body with full HTTP context (URL, headers, cURL) using real captured session data.
-     */
+    private CopyablePayloadBuilder() {
+    }
+
     public static String wrapPayloadWithContext(
             String methodName,
             String jsonBody,
@@ -17,200 +22,153 @@ public final class CopyablePayloadBuilder {
             JsonRpcIndex index
     ) {
         String url = resolveUrl(methodName, index);
-        AuthContextStore.AuthContext adminCtx = authContextStore.firstContextByRole(RoleType.ADMIN);
-        AuthContextStore.AuthContext lowPrivCtx = authContextStore.firstContextByRole(RoleType.LOW_PRIV);
-
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("=== TARGET ===\n");
-        sb.append("POST ").append(url.isBlank() ? "<target_url>/jsonrpc" : url).append("\n\n");
-
-        if (lowPrivCtx != null && hasAnyHeader(lowPrivCtx)) {
-            sb.append("=== HEADERS (LOW_PRIV session — use these to test) ===\n");
-            sb.append("Content-Type: application/json\n");
-            appendHeaders(sb, lowPrivCtx);
-            sb.append("\n");
-        } else if (adminCtx != null && hasAnyHeader(adminCtx)) {
-            sb.append("=== HEADERS (ADMIN session — captured) ===\n");
-            sb.append("Content-Type: application/json\n");
-            appendHeaders(sb, adminCtx);
-            sb.append("\n");
+        if (url == null || url.isBlank()) {
+            url = "https://" + DEFAULT_HOST + DEFAULT_PATH;
         }
 
-        sb.append("=== BODY ===\n");
-        sb.append(jsonBody).append("\n\n");
-
-        if (lowPrivCtx != null && hasAnyHeader(lowPrivCtx)) {
-            sb.append("=== cURL (LOW_PRIV — test this) ===\n");
-            sb.append(buildCurl(url, lowPrivCtx, jsonBody)).append("\n\n");
+        String body = extractJsonBody(jsonBody);
+        if (body.isBlank()) {
+            body = "{}";
         }
 
-        if (adminCtx != null && hasAnyHeader(adminCtx)) {
-            sb.append("=== cURL (ADMIN — for comparison) ===\n");
-            sb.append(buildCurl(url, adminCtx, jsonBody)).append("\n\n");
-        }
+        String host = hostFromUrl(url);
+        String path = pathFromUrl(url);
+        String http = buildCanonicalHttpRequest(host, path, body);
 
-        if (lowPrivCtx != null && adminCtx != null && hasAnyHeader(lowPrivCtx) && hasAnyHeader(adminCtx)) {
-            sb.append("=== SWAP HEADERS TO TEST ===\n");
-            sb.append("LOW_PRIV:\n");
-            appendHeaders(sb, lowPrivCtx);
-            sb.append("\nADMIN:\n");
-            appendHeaders(sb, adminCtx);
-            sb.append("\n");
-        }
-
-        return sb.toString().trim();
+        StringBuilder builder = new StringBuilder();
+        builder.append("=== TARGET ===\n");
+        builder.append("POST ").append(url).append("\n\n");
+        builder.append("=== HTTP ===\n");
+        builder.append(http).append("\n\n");
+        builder.append("=== cURL ===\n");
+        builder.append(buildCurl("https://" + host + path, body));
+        return builder.toString();
     }
 
-    /**
-     * Builds a cURL command for a specific suggestion using real captured session data.
-     */
     public static String buildCurlForSuggestion(
             AttackSuggestion suggestion,
             AuthContextStore authContextStore,
             JsonRpcIndex index
     ) {
-        if (suggestion.repeaterRequest() != null && !suggestion.repeaterRequest().isBlank()) {
-            RawRequest rawRequest = RawRequest.parse(suggestion.repeaterRequest());
-            String path = rawRequest.path();
-            String host = suggestion.host() == null ? "" : suggestion.host();
-            String url = host.isBlank() ? resolveUrl(suggestion.primaryMethod(), index) : "https://" + host + path;
-            return buildCurlFromRaw(url, rawRequest.headers(), rawRequest.body());
-        }
-
-        String methodName = suggestion.primaryMethod();
-        String url = resolveUrl(methodName, index);
-        String jsonBody = extractJsonBody(suggestion.exploitPayload());
-        AuthContextStore.AuthContext lowPrivCtx = authContextStore.firstContextByRole(RoleType.LOW_PRIV);
-        if (lowPrivCtx == null) {
-            lowPrivCtx = authContextStore.firstContextByRole(RoleType.ADMIN);
-        }
-        return buildCurl(url, lowPrivCtx, jsonBody);
+        String url = resolveUrlForSuggestion(suggestion, index);
+        String body = extractBodyForSuggestion(suggestion);
+        return buildCurl(url, body);
     }
 
-    /**
-     * Builds a raw HTTP request for clipboard (URL + headers + body, no section markers).
-     */
     public static String buildHttpRequest(
             AttackSuggestion suggestion,
             AuthContextStore authContextStore,
             JsonRpcIndex index
     ) {
-        if (suggestion.repeaterRequest() != null && !suggestion.repeaterRequest().isBlank()) {
-            return suggestion.repeaterRequest();
+        String body = extractBodyForSuggestion(suggestion);
+
+        String host = DEFAULT_HOST;
+        String path = DEFAULT_PATH;
+        String url = resolveUrlForSuggestion(suggestion, index);
+        if (url != null && !url.isBlank()) {
+            host = hostFromUrl(url);
+            path = pathFromUrl(url);
         }
 
-        String methodName = suggestion.primaryMethod();
-        String url = resolveUrl(methodName, index);
-        String jsonBody = extractJsonBody(suggestion.exploitPayload());
-        AuthContextStore.AuthContext ctx = authContextStore.firstContextByRole(RoleType.LOW_PRIV);
-        if (ctx == null) {
-            ctx = authContextStore.firstContextByRole(RoleType.ADMIN);
+        if (suggestion != null && suggestion.host() != null && !suggestion.host().isBlank()) {
+            host = normalizeHost(suggestion.host());
         }
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("POST ").append(url.isBlank() ? "<target_url>/jsonrpc" : url).append(" HTTP/1.1\n");
-        sb.append("Content-Type: application/json\n");
-        if (ctx != null) {
-            appendHeaders(sb, ctx);
-        }
-        sb.append("\n");
-        sb.append(jsonBody);
-        return sb.toString();
+        return buildCanonicalHttpRequest(host, path, body);
     }
 
     /**
-     * Builds a cURL command string.
+     * Kept for compatibility with existing call sites. The auth context is intentionally ignored.
      */
     public static String buildCurl(String url, AuthContextStore.AuthContext context, String jsonBody) {
-        String targetUrl = url == null || url.isBlank() ? "<target_url>/jsonrpc" : url;
-
-        StringBuilder curl = new StringBuilder();
-        curl.append("curl -X POST '").append(targetUrl).append("'");
-
-        curl.append(" \\\n  -H 'Content-Type: application/json'");
-
-        if (context != null) {
-            if (!context.rawCookieHeader().isBlank()) {
-                curl.append(" \\\n  -H 'Cookie: ").append(escapeSingleQuotes(context.rawCookieHeader())).append("'");
-            }
-            if (!context.rawAuthorizationHeader().isBlank()) {
-                curl.append(" \\\n  -H 'Authorization: ").append(escapeSingleQuotes(context.rawAuthorizationHeader())).append("'");
-            }
-        }
-
-        String compactBody = jsonBody == null ? "{}" : jsonBody.replaceAll("\\s+", " ").trim();
-        curl.append(" \\\n  -d '").append(escapeSingleQuotes(compactBody)).append("'");
-
-        return curl.toString();
+        return buildCurl(url, jsonBody);
     }
 
-    /**
-     * Extracts the JSON body from a formatted payload string (between === BODY === markers).
-     */
-    public static String extractJsonBody(String exploitPayload) {
-        if (exploitPayload == null || exploitPayload.isBlank()) {
+    public static String extractJsonBody(String payload) {
+        if (payload == null || payload.isBlank()) {
             return "{}";
         }
 
-        RawRequest raw = RawRequest.parse(exploitPayload);
-        if (!raw.body().isBlank()) {
-            return raw.body().trim();
-        }
+        String normalized = payload.replace("\r\n", "\n");
 
-        int bodyStart = exploitPayload.indexOf("=== BODY ===");
-        if (bodyStart >= 0) {
-            String afterMarker = exploitPayload.substring(bodyStart + "=== BODY ===".length()).trim();
+        int bodyMarker = normalized.indexOf("=== BODY ===");
+        if (bodyMarker >= 0) {
+            String afterMarker = normalized.substring(bodyMarker + "=== BODY ===".length()).trim();
             int nextSection = afterMarker.indexOf("\n===");
-            if (nextSection >= 0) {
-                return afterMarker.substring(0, nextSection).trim();
+            String bodySection = nextSection >= 0 ? afterMarker.substring(0, nextSection).trim() : afterMarker;
+            if (!bodySection.isBlank()) {
+                return bodySection;
             }
-            return afterMarker.trim();
         }
 
-        // No section markers — entire payload is the JSON body
-        return exploitPayload.trim();
+        RawRequest raw = RawRequest.parse(normalized);
+        if (!raw.body().isBlank()) {
+            String candidate = raw.body().trim();
+            int notesStart = candidate.indexOf("\nExpected secure:");
+            return notesStart >= 0 ? candidate.substring(0, notesStart).trim() : candidate;
+        }
+
+        if (normalized.startsWith("POST ")) {
+            int split = normalized.indexOf("\n\n");
+            if (split >= 0) {
+                String candidate = normalized.substring(split + 2).trim();
+                int notesStart = candidate.indexOf("\nExpected secure:");
+                return notesStart >= 0 ? candidate.substring(0, notesStart).trim() : candidate;
+            }
+        }
+
+        return normalized.trim();
     }
 
-    private static String buildCurlFromRaw(String url, java.util.List<String> headers, String body) {
-        String targetUrl = (url == null || url.isBlank()) ? "<target_url>/jsonrpc" : url;
-        StringBuilder curl = new StringBuilder();
-        curl.append("curl -X POST '").append(targetUrl).append("'");
-
-        boolean contentTypePresent = false;
-        for (String header : headers) {
-            if (header == null || header.isBlank()) {
-                continue;
-            }
-            String lowered = header.toLowerCase();
-            if (lowered.startsWith("host:")) {
-                continue;
-            }
-            if (lowered.startsWith("content-length:")) {
-                continue;
-            }
-            if (lowered.startsWith("connection:")) {
-                continue;
-            }
-            if (lowered.startsWith("content-type:")) {
-                contentTypePresent = true;
-            }
-            curl.append(" \\\n  -H '").append(escapeSingleQuotes(header.trim())).append("'");
+    private static String extractBodyForSuggestion(AttackSuggestion suggestion) {
+        if (suggestion == null) {
+            return "{}";
         }
 
-        if (!contentTypePresent) {
-            curl.append(" \\\n  -H 'Content-Type: application/json'");
+        String body = extractJsonBody(suggestion.effectivePayload());
+        return body.isBlank() ? "{}" : body;
+    }
+
+    private static String buildCanonicalHttpRequest(String host, String path, String body) {
+        String resolvedHost = (host == null || host.isBlank()) ? DEFAULT_HOST : normalizeHost(host);
+        String resolvedPath = (path == null || path.isBlank()) ? DEFAULT_PATH : normalizePath(path);
+        String resolvedBody = (body == null || body.isBlank()) ? "{}" : body.trim();
+
+        return "POST " + resolvedPath + " HTTP/2\n"
+                + "Host: " + resolvedHost + "\n"
+                + "Content-Type: text/plain;charset=UTF-8\n\n"
+                + resolvedBody;
+    }
+
+    private static String buildCurl(String url, String jsonBody) {
+        String targetUrl = (url == null || url.isBlank()) ? "https://" + DEFAULT_HOST + DEFAULT_PATH : url;
+        String compactBody = jsonBody == null ? "{}" : jsonBody.replaceAll("\\s+", " ").trim();
+
+        return "curl -X POST '" + targetUrl + "' "
+                + "-H 'Content-Type: text/plain;charset=UTF-8' "
+                + "-d '" + escapeSingleQuotes(compactBody) + "'";
+    }
+
+    private static String resolveUrlForSuggestion(AttackSuggestion suggestion, JsonRpcIndex index) {
+        if (suggestion != null && suggestion.host() != null && !suggestion.host().isBlank()) {
+            return "https://" + normalizeHost(suggestion.host()) + DEFAULT_PATH;
         }
 
-        String compactBody = body == null ? "{}" : body.replaceAll("\\s+", " ").trim();
-        curl.append(" \\\n  -d '").append(escapeSingleQuotes(compactBody)).append("'");
-        return curl.toString();
+        String resolved = resolveUrl(suggestion == null ? "" : suggestion.primaryMethod(), index);
+        if (resolved != null && !resolved.isBlank()) {
+            String host = hostFromUrl(resolved);
+            String path = pathFromUrl(resolved);
+            return "https://" + host + path;
+        }
+
+        return "https://" + DEFAULT_HOST + DEFAULT_PATH;
     }
 
     private static String resolveUrl(String methodName, JsonRpcIndex index) {
         if (methodName == null || methodName.isBlank() || "(multiple)".equals(methodName)) {
             return "";
         }
+
         Optional<JsonRpcIndex.MethodDetails> details = index.snapshotMethodDetails(methodName);
         if (details.isPresent()) {
             JsonRpcRecord rawRecord = details.get().primaryRawRecord();
@@ -222,18 +180,73 @@ public final class CopyablePayloadBuilder {
         return "";
     }
 
-    private static boolean hasAnyHeader(AuthContextStore.AuthContext ctx) {
-        return ctx != null
-                && (!ctx.rawAuthorizationHeader().isBlank() || !ctx.rawCookieHeader().isBlank());
+    private static String hostFromUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return DEFAULT_HOST;
+        }
+
+        try {
+            URI uri = new URI(url);
+            String host = uri.getHost();
+            if (host != null && !host.isBlank()) {
+                return normalizeHost(host);
+            }
+        } catch (Exception ignored) {
+            // Fall through.
+        }
+
+        return DEFAULT_HOST;
     }
 
-    private static void appendHeaders(StringBuilder sb, AuthContextStore.AuthContext ctx) {
-        if (!ctx.rawCookieHeader().isBlank()) {
-            sb.append("Cookie: ").append(ctx.rawCookieHeader()).append("\n");
+    private static String pathFromUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return DEFAULT_PATH;
         }
-        if (!ctx.rawAuthorizationHeader().isBlank()) {
-            sb.append("Authorization: ").append(ctx.rawAuthorizationHeader()).append("\n");
+
+        try {
+            URI uri = new URI(url);
+            String path = uri.getRawPath();
+            if (path != null && !path.isBlank()) {
+                return normalizePath(path);
+            }
+        } catch (Exception ignored) {
+            // Fall through.
         }
+
+        return DEFAULT_PATH;
+    }
+
+    private static String normalizeHost(String host) {
+        if (host == null || host.isBlank()) {
+            return DEFAULT_HOST;
+        }
+
+        String normalized = host.trim().toLowerCase(Locale.ROOT);
+        int colon = normalized.indexOf(':');
+        if (colon > 0 && normalized.indexOf(']') < 0) {
+            normalized = normalized.substring(0, colon);
+        }
+        while (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized.isBlank() ? DEFAULT_HOST : normalized;
+    }
+
+    private static String normalizePath(String path) {
+        if (path == null || path.isBlank()) {
+            return DEFAULT_PATH;
+        }
+        String trimmed = path.trim();
+        return trimmed.startsWith("/") ? trimmed : "/" + trimmed;
+    }
+
+    private static String normalizeRawRequest(String rawHttp) {
+        if (rawHttp == null || rawHttp.isBlank()) {
+            return "";
+        }
+        return rawHttp.contains("\\r\\n") && !rawHttp.contains("\r\n")
+                ? rawHttp.replace("\\r\\n", "\r\n")
+                : rawHttp;
     }
 
     private static String escapeSingleQuotes(String value) {
@@ -243,48 +256,46 @@ public final class CopyablePayloadBuilder {
         return value.replace("'", "'\\''");
     }
 
-    private record RawRequest(String path, java.util.List<String> headers, String body) {
+    private record RawRequest(String path, List<String> headers, String body) {
         private static RawRequest parse(String rawHttp) {
-            if (rawHttp == null || rawHttp.isBlank()) {
-                return new RawRequest("/jsonrpc", java.util.List.of(), "");
+            String normalized = normalizeRawRequest(rawHttp);
+            if (normalized.isBlank()) {
+                return new RawRequest(DEFAULT_PATH, List.of(), "");
             }
 
-            boolean escapedMode = rawHttp.contains("\\r\\n") && !rawHttp.contains("\r\n");
-            String parseable = escapedMode ? rawHttp.replace("\\r\\n", "\r\n") : rawHttp;
-
-            int split = parseable.indexOf("\r\n\r\n");
+            int split = normalized.indexOf("\r\n\r\n");
             int separatorLength = 4;
             if (split < 0) {
-                split = parseable.indexOf("\n\n");
+                split = normalized.indexOf("\n\n");
                 separatorLength = 2;
             }
 
             if (split < 0) {
-                return new RawRequest("/jsonrpc", java.util.List.of(), "");
+                return new RawRequest(DEFAULT_PATH, List.of(), "");
             }
 
-            String head = parseable.substring(0, split);
-            String body = parseable.substring(split + separatorLength);
+            String head = normalized.substring(0, split);
+            String body = normalized.substring(split + separatorLength);
             String[] lines = head.split("\\r?\\n");
             if (lines.length == 0) {
-                return new RawRequest("/jsonrpc", java.util.List.of(), body);
+                return new RawRequest(DEFAULT_PATH, List.of(), body);
             }
 
-            String path = "/jsonrpc";
-            String[] requestLineParts = lines[0].split(" ");
-            if (requestLineParts.length >= 2 && requestLineParts[1] != null && !requestLineParts[1].isBlank()) {
-                path = requestLineParts[1];
+            String path = DEFAULT_PATH;
+            String[] requestParts = lines[0].split("\\s+");
+            if (requestParts.length >= 2 && requestParts[1] != null && !requestParts[1].isBlank()) {
+                path = normalizePath(requestParts[1]);
             }
 
-            java.util.List<String> headers = new java.util.ArrayList<>();
+            List<String> headers = new ArrayList<>();
             for (int i = 1; i < lines.length; i++) {
                 String line = lines[i];
-                if (!line.isBlank()) {
+                if (line != null && !line.isBlank()) {
                     headers.add(line.trim());
                 }
             }
 
-            return new RawRequest(path, headers, body);
+            return new RawRequest(path, List.copyOf(headers), body);
         }
     }
 }

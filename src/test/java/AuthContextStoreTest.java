@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -14,12 +15,12 @@ class AuthContextStoreTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
-    void contextKeySeparatesDifferentHostsEvenWithSharedSession() {
+        void sharedSessionIdAcrossHostsCreatesDistinctContexts() {
         AuthContextStore store = new AuthContextStore(objectMapper);
 
         JsonRpcRecord recordA = createRecord(
                 "rec-a",
-                "bugcrowd5.geotab.com",
+                "tenant-a.example.test",
                 "/apiv1",
                 "sid-shared",
                 "db-shared",
@@ -29,7 +30,7 @@ class AuthContextStoreTest {
 
         JsonRpcRecord recordB = createRecord(
                 "rec-b",
-                "bugcrowd6.geotab.com",
+                "tenant-b.example.test",
                 "/apiv1",
                 "sid-shared",
                 "db-shared",
@@ -40,20 +41,20 @@ class AuthContextStoreTest {
         AuthContextStore.AuthContext ctxA = store.observeRecord(recordA, "Device.Get");
         AuthContextStore.AuthContext ctxB = store.observeRecord(recordB, "Device.Get");
 
+        assertEquals("host=tenant-a.example.test|db=db-shared|sid=sid-shared|user=alice", ctxA.contextKey());
+        assertEquals("host=tenant-b.example.test|db=db-shared|sid=sid-shared|user=alice", ctxB.contextKey());
         assertNotEquals(ctxA.contextKey(), ctxB.contextKey());
-        assertTrue(ctxA.contextKey().contains("host=bugcrowd5.geotab.com"));
-        assertTrue(ctxB.contextKey().contains("host=bugcrowd6.geotab.com"));
         assertEquals(2, store.snapshotContexts().size());
         assertEquals(2, store.contextKeysForMethod("Device.Get").size());
     }
 
     @Test
-    void sameHostDbUserMergesIntoSingleContextEvenWithDifferentAuthTokens() {
+        void missingSessionIdDoesNotCreateTrackedContext() {
         AuthContextStore store = new AuthContextStore(objectMapper);
 
         JsonRpcRecord recordA = createRecord(
                 "rec-no-session-a",
-                "bugcrowd5.geotab.com",
+                "tenant-a.example.test",
                 "/apiv1",
                 "",
                 "db-shared",
@@ -63,7 +64,7 @@ class AuthContextStoreTest {
 
         JsonRpcRecord recordB = createRecord(
                 "rec-no-session-b",
-                "bugcrowd5.geotab.com",
+                "tenant-a.example.test",
                 "/apiv1",
                 "",
                 "db-shared",
@@ -74,13 +75,142 @@ class AuthContextStoreTest {
         AuthContextStore.AuthContext ctxA = store.observeRecord(recordA, "Device.Get");
         AuthContextStore.AuthContext ctxB = store.observeRecord(recordB, "Device.Get");
 
-        // Same host + database + userName → same context key (no fragmentation)
-        assertEquals(ctxA.contextKey(), ctxB.contextKey());
-        // The context should store the latest auth header
-        assertEquals("Bearer token-b", ctxB.rawAuthorizationHeader());
-        // Only 1 context should exist (not fragmented)
-        assertEquals(1, store.snapshotContexts().size());
+        assertEquals("unknown-session", ctxA.contextKey());
+        assertEquals("unknown-session", ctxB.contextKey());
+        assertTrue(store.snapshotContexts().isEmpty());
     }
+
+        @Test
+        void roleAssignmentStaysStableAcrossCompatibleTraffic() {
+                AuthContextStore store = new AuthContextStore(objectMapper);
+
+                JsonRpcRecord first = createRecord(
+                                "rec-stable-1",
+                                "tenant-a.example.test",
+                                "/apiv1",
+                                "sid-stable",
+                                "db-a",
+                                "alice",
+                                "Bearer token-a"
+                );
+
+                AuthContextStore.AuthContext initial = store.observeRecord(first, "Device.Get");
+                assertTrue(store.setRoleForContextKey(initial.contextKey(), RoleType.ADMIN));
+
+                JsonRpcRecord second = createRecord(
+                                "rec-stable-2",
+                                "tenant-a.example.test",
+                                "/apiv1",
+                                "sid-stable",
+                                "db-a",
+                                "",
+                                "Bearer token-a"
+                );
+
+                AuthContextStore.AuthContext after = store.observeRecord(second, "Device.Get");
+                assertEquals(initial.contextKey(), after.contextKey());
+                assertEquals(RoleType.ADMIN, store.roleForContextKey(after.contextKey()));
+                assertEquals(1, store.snapshotSessions().size());
+        }
+
+        @Test
+        void roleCanBeSwitchedDirectly() {
+                AuthContextStore store = new AuthContextStore(objectMapper);
+
+                JsonRpcRecord record = createRecord(
+                                "rec-lock-1",
+                                "tenant-a.example.test",
+                                "/apiv1",
+                                "sid-lock",
+                                "db-a",
+                                "alice",
+                                "Bearer token-a"
+                );
+
+                AuthContextStore.AuthContext context = store.observeRecord(record, "Device.Get");
+                assertTrue(store.setRoleForContextKey(context.contextKey(), RoleType.ADMIN));
+
+                // Role switching is now allowed — users must be able to correct mistaken tags
+                boolean directSwitch = store.setRoleForContextKey(context.contextKey(), RoleType.LOW_PRIV);
+                assertTrue(directSwitch);
+                assertEquals(RoleType.LOW_PRIV, store.roleForContextKey(context.contextKey()));
+
+                // And back to ADMIN
+                assertTrue(store.setRoleForContextKey(context.contextKey(), RoleType.ADMIN));
+                assertEquals(RoleType.ADMIN, store.roleForContextKey(context.contextKey()));
+        }
+
+            @Test
+            void roleForMethodReturnsMixedWhenAdminAndLowPrivExist() {
+                AuthContextStore store = new AuthContextStore(objectMapper);
+
+                JsonRpcRecord adminRecord = createRecord(
+                        "rec-mixed-admin",
+                        "tenant-a.example.test",
+                        "/apiv1",
+                        "sid-mixed-admin",
+                        "db-a",
+                        "alice",
+                        "Bearer token-a"
+                );
+                JsonRpcRecord lowPrivRecord = createRecord(
+                        "rec-mixed-low",
+                        "tenant-a.example.test",
+                        "/apiv1",
+                        "sid-mixed-low",
+                        "db-a",
+                        "bob",
+                        "Bearer token-b"
+                );
+
+                AuthContextStore.AuthContext adminCtx = store.observeRecord(adminRecord, "Device.Get");
+                AuthContextStore.AuthContext lowCtx = store.observeRecord(lowPrivRecord, "Device.Get");
+
+                assertTrue(store.setRoleForContextKey(adminCtx.contextKey(), RoleType.ADMIN));
+                assertTrue(store.setRoleForContextKey(lowCtx.contextKey(), RoleType.LOW_PRIV));
+
+                assertEquals(RoleType.MIXED, store.roleForMethod("Device.Get"));
+            }
+
+            @Test
+            void partialContextDoesNotMergeWhenAmbiguous() {
+                AuthContextStore store = new AuthContextStore(objectMapper);
+
+                JsonRpcRecord knownAlice = createRecord(
+                        "rec-amb-1",
+                        "tenant-a.example.test",
+                        "/apiv1",
+                        "sid-amb",
+                        "db-a",
+                        "alice",
+                        "Bearer token-a"
+                );
+                JsonRpcRecord knownBob = createRecord(
+                        "rec-amb-2",
+                        "tenant-a.example.test",
+                        "/apiv1",
+                        "sid-amb",
+                        "db-a",
+                        "bob",
+                        "Bearer token-b"
+                );
+
+                store.observeRecord(knownAlice, "Device.Get");
+                store.observeRecord(knownBob, "Device.Get");
+
+                JsonRpcRecord partial = createRecord(
+                        "rec-amb-3",
+                        "tenant-a.example.test",
+                        "/apiv1",
+                        "sid-amb",
+                        "db-a",
+                        "",
+                        "Bearer token-c"
+                );
+
+                AuthContextStore.AuthContext partialCtx = store.observeRecord(partial, "Device.Get");
+                assertEquals("host=tenant-a.example.test|db=db-a|sid=sid-amb|user=unknown-user", partialCtx.contextKey());
+            }
 
     private JsonRpcRecord createRecord(
             String recordId,

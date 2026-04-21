@@ -4,28 +4,51 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MyGeotabScopeTest {
+    private static final String ALLOWED_HOSTS_PROPERTY = "logichunter.allowedHosts";
 
     @Test
-    void allowsCurrentBugcrowdHostVariants() {
-        assertTrue(MyGeotabScope.isAllowedHost("bugcrowd.geotab.com"));
-        assertTrue(MyGeotabScope.isAllowedHost("bugcrowd7.geotab.com"));
-        assertTrue(MyGeotabScope.isAllowedHost("bugcrowd10.geotab.com"));
+    void allowsAnyHostWhenNoFilterConfigured() {
+        String previous = System.getProperty(ALLOWED_HOSTS_PROPERTY);
+        try {
+            System.clearProperty(ALLOWED_HOSTS_PROPERTY);
+            assertTrue(MyGeotabScope.isAllowedHost("api.example.com"));
+            assertTrue(MyGeotabScope.isAllowedHost("tenant-a.internal.example"));
+        } finally {
+            restoreAllowedHostsProperty(previous);
+        }
     }
 
     @Test
-    void allowsHostWithPortByNormalizing() {
-        assertTrue(MyGeotabScope.isAllowedHost("bugcrowd.geotab.com:443"));
-    }
-
-    @Test
-    void rejectsOutOfScopeHosts() {
-        assertFalse(MyGeotabScope.isAllowedHost("example.com"));
-        assertFalse(MyGeotabScope.isAllowedHost("api.bugcrowd.com"));
+    void honorsConfiguredAllowList() {
+        String previous = System.getProperty(ALLOWED_HOSTS_PROPERTY);
+        try {
+            System.setProperty(ALLOWED_HOSTS_PROPERTY, "api.example.com,*.trusted.example.net");
+            assertTrue(MyGeotabScope.isAllowedHost("api.example.com"));
+            assertTrue(MyGeotabScope.isAllowedHost("tenant.trusted.example.net"));
+            assertTrue(MyGeotabScope.isAllowedHost("api.example.com:443"));
+            assertFalse(MyGeotabScope.isAllowedHost("api.other.com"));
+        } finally {
+            restoreAllowedHostsProperty(previous);
+        }
     }
 
     @Test
     void extractsNormalizedHostFromUrl() {
-        assertTrue(MyGeotabScope.isAllowedUrl("https://bugcrowd.geotab.com/apiv1"));
-        assertFalse(MyGeotabScope.isAllowedUrl("https://example.com/apiv1"));
+        String previous = System.getProperty(ALLOWED_HOSTS_PROPERTY);
+        try {
+            System.setProperty(ALLOWED_HOSTS_PROPERTY, "api.example.com");
+            assertTrue(MyGeotabScope.isAllowedUrl("https://api.example.com/jsonrpc"));
+            assertFalse(MyGeotabScope.isAllowedUrl("https://api.other.com/jsonrpc"));
+        } finally {
+            restoreAllowedHostsProperty(previous);
+        }
+    }
+
+    private void restoreAllowedHostsProperty(String previous) {
+        if (previous == null) {
+            System.clearProperty(ALLOWED_HOSTS_PROPERTY);
+            return;
+        }
+        System.setProperty(ALLOWED_HOSTS_PROPERTY, previous);
     }
 }

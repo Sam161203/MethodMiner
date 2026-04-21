@@ -1,39 +1,33 @@
 import burp.api.montoya.logging.Logging;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AttackSuggestionServiceTest {
+        private static final String ALLOWED_HOSTS_PROPERTY = "logichunter.allowedHosts";
+
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final JsonRpcParser parser = new JsonRpcParser(objectMapper, 128);
+    private final JsonRpcParser parser = new JsonRpcParser(objectMapper, 512);
 
     @Test
-    void suggestionAssertionsAreBehaviorBasedAndStable() throws Exception {
+    void generatesFindingsForCoreDetectors() throws Exception {
         JsonRpcIndex index = new JsonRpcIndex();
         NoopLogging logging = new NoopLogging();
         AuthContextStore authContextStore = new AuthContextStore(objectMapper);
 
         try (SecurityAnalyzerService security = new SecurityAnalyzerService(objectMapper, index, authContextStore, logging);
              WorkflowGraphService workflow = new WorkflowGraphService(objectMapper, logging);
-             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging);
+             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging, authContextStore);
              AttackSuggestionService suggestions = new AttackSuggestionService(
                      objectMapper,
                      index,
@@ -44,46 +38,69 @@ class AttackSuggestionServiceTest {
                      logging
              )) {
 
-            Scenario scenario = seedAllowedHostScenario(index, security, workflow, entityStore, suggestions, authContextStore);
-            List<AttackSuggestion> rows = scenario.suggestions();
+            JsonRpcRecord adminGet = createStandardRecord(
+                    "admin-get",
+                    "api.example.test",
+                    "Device.Get",
+                    "Device",
+                    "sid-admin",
+                    "db-admin",
+                    "admin.user",
+                    "x-1",
+                    200,
+                    "{\"result\":[{\"id\":\"x-1\",\"typeName\":\"Device\"}],\"id\":1}"
+            );
 
-            assertFalse(rows.isEmpty(), "Expected non-empty suggestions for allowed MyGeotab host scenario");
+            JsonRpcRecord lowGet = createStandardRecord(
+                    "low-get",
+                    "api.example.test",
+                    "Device.Get",
+                    "Device",
+                    "sid-low",
+                    "db-low",
+                    "low.user",
+                    "x-1",
+                    403,
+                    "{\"error\":{\"code\":403,\"message\":\"forbidden\"},\"id\":2}"
+            );
 
-            assertTrue(hasFamily(rows, "cross-tenant"), "Expected at least one cross-tenant/cross-database suggestion");
-            assertTrue(hasFamily(rows, "auth"), "Expected at least one authorization-focused suggestion");
-            assertTrue(hasFamily(rows, "privilege"), "Expected at least one privilege escalation/replay suggestion");
-            assertTrue(hasFamily(rows, "batch"), "Expected at least one batch/multicall suggestion");
-            assertTrue(hasFamily(rows, "notification"), "Expected at least one notification-mode suggestion");
-            assertTrue(hasFamily(rows, "param-mutation"), "Expected at least one parameter mutation suggestion");
+            JsonRpcRecord lowMultiCall = createRawRecord(
+                    "low-multicall",
+                    "api.example.test",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"ExecuteMultiCall\",\"params\":{\"credentials\":{\"database\":\"db-low\",\"sessionId\":\"sid-low\",\"userName\":\"low.user\"},\"calls\":[{\"method\":\"Device.Get\",\"params\":{\"typeName\":\"Device\",\"search\":{}}}]},\"id\":3}",
+                    200,
+                    "{\"result\":[],\"id\":3}"
+            );
 
-            for (AttackSuggestion suggestion : rows) {
-                assertNotNull(suggestion.category());
-                assertFalse(suggestion.category().isBlank());
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, adminGet);
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, lowGet);
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, lowMultiCall);
 
-                assertNotNull(suggestion.primaryMethod());
-                assertFalse(suggestion.primaryMethod().isBlank());
+            authContextStore.setRoleForRecord(adminGet.recordId(), RoleType.ADMIN);
+            authContextStore.setRoleForRecord(lowGet.recordId(), RoleType.LOW_PRIV);
+            authContextStore.setRoleForRecord(lowMultiCall.recordId(), RoleType.LOW_PRIV);
 
-                assertNotNull(suggestion.host());
-                assertFalse(suggestion.host().isBlank());
+            suggestions.recomputeSync();
+            List<AttackSuggestion> rows = suggestions.snapshotSuggestions();
+            assertFalse(rows.isEmpty(), "Expected findings from detector pipeline");
 
-                assertNotNull(suggestion.repeaterRequest());
-                assertFalse(suggestion.repeaterRequest().isBlank());
-
-                assertTrue(suggestion.confidenceScore() > 0, "confidenceScore must be > 0");
-                assertTrue(suggestion.effectivenessScore() > 0, "effectivenessScore must be > 0");
-            }
+            Set<String> types = rows.stream().map(AttackSuggestion::findingType).collect(Collectors.toSet());
+            assertTrue(types.contains("BOLA_IDOR"));
+            assertTrue(types.contains("PRIVILEGE_DIFF"));
+                        assertTrue(types.contains("MULTICALL_CHAIN"));
+            assertTrue(types.contains("CROSS_TENANT"));
         }
     }
 
     @Test
-    void mutationSuggestionsModifyRealCapturedRequestAndPreserveContext() throws Exception {
+    void payloadUsesBodyCredentialsAndNoAuthHeaders() throws Exception {
         JsonRpcIndex index = new JsonRpcIndex();
         NoopLogging logging = new NoopLogging();
         AuthContextStore authContextStore = new AuthContextStore(objectMapper);
 
         try (SecurityAnalyzerService security = new SecurityAnalyzerService(objectMapper, index, authContextStore, logging);
              WorkflowGraphService workflow = new WorkflowGraphService(objectMapper, logging);
-             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging);
+             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging, authContextStore);
              AttackSuggestionService suggestions = new AttackSuggestionService(
                      objectMapper,
                      index,
@@ -94,291 +111,202 @@ class AttackSuggestionServiceTest {
                      logging
              )) {
 
-            Scenario scenario = seedAllowedHostScenario(index, security, workflow, entityStore, suggestions, authContextStore);
+            JsonRpcRecord adminGet = createStandardRecord(
+                    "admin-get",
+                    "api.example.test",
+                    "Device.Get",
+                    "Device",
+                    "sid-admin",
+                    "db-admin",
+                    "admin.user",
+                    "x-1",
+                    200,
+                    "{\"result\":[{\"id\":\"x-1\",\"typeName\":\"Device\"}],\"id\":1}"
+            );
 
-            Set<String> capturedRawRequests = new HashSet<>();
-            for (JsonRpcRecord record : scenario.records()) {
-                capturedRawRequests.add(record.request().rawHttpText());
-            }
+            JsonRpcRecord lowGet = createStandardRecord(
+                    "low-get",
+                    "api.example.test",
+                    "Device.Get",
+                    "Device",
+                    "sid-low",
+                    "db-low",
+                    "low.user",
+                    "x-1",
+                    403,
+                    "{\"error\":{\"code\":403,\"message\":\"forbidden\"},\"id\":2}"
+            );
 
-            Optional<AttackSuggestion> mutatedSuggestion = scenario.suggestions().stream()
-                    .filter(s -> s.repeaterRequest() != null && !s.repeaterRequest().isBlank())
-                    .filter(s -> !capturedRawRequests.contains(s.repeaterRequest()))
-                    .findFirst();
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, adminGet);
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, lowGet);
 
-            assertTrue(mutatedSuggestion.isPresent(), "Expected at least one suggestion with a mutated captured request");
+            authContextStore.setRoleForRecord(adminGet.recordId(), RoleType.ADMIN);
+            authContextStore.setRoleForRecord(lowGet.recordId(), RoleType.LOW_PRIV);
 
-            ParsedHttpRequest mutated = parseRequest(mutatedSuggestion.get().repeaterRequest());
-            JsonNode mutatedBody = objectMapper.readTree(mutated.body());
-            String mutatedFingerprint = methodFingerprint(mutatedBody);
+            suggestions.recomputeSync();
+            List<AttackSuggestion> rows = suggestions.snapshotSuggestions();
+            assertFalse(rows.isEmpty());
 
-            Optional<ParsedHttpRequest> sourceOptional = scenario.records().stream()
-                    .map(record -> parseRequest(record.request().rawHttpText()))
-                    .filter(source -> Objects.equals(source.requestLine(), mutated.requestLine()))
-                    .filter(source -> Objects.equals(source.header("host"), mutated.header("host")))
-                    .filter(source -> Objects.equals(source.header("cookie"), mutated.header("cookie")))
-                    .filter(source -> Objects.equals(source.header("authorization"), mutated.header("authorization")))
-                    .filter(source -> {
-                        try {
-                            return methodFingerprint(objectMapper.readTree(source.body())).equals(mutatedFingerprint);
-                        } catch (Exception ignored) {
-                            return false;
-                        }
-                    })
-                    .findFirst();
+            AttackSuggestion finding = rows.get(0);
+            assertTrue(finding.payload().contains("\"credentials\""));
+            assertTrue(finding.payload().contains("\"sessionId\""));
+            assertFalse(finding.payload().contains("Authorization:"));
+            assertFalse(finding.payload().contains("Cookie:"));
+            assertTrue(finding.repeaterRequest().startsWith("POST /apiv1"));
 
-            assertTrue(sourceOptional.isPresent(), "Expected mutation to be based on a real captured request context");
-
-            ParsedHttpRequest source = sourceOptional.get();
-            assertEquals(source.requestLine(), mutated.requestLine(), "Request line must be preserved");
-            assertEquals(source.header("host"), mutated.header("host"), "Host header must be preserved");
-            assertEquals(source.header("cookie"), mutated.header("cookie"), "Cookie header must be preserved");
-            assertEquals(source.header("authorization"), mutated.header("authorization"), "Authorization header must be preserved");
-
-            JsonNode sourceBody = objectMapper.readTree(source.body());
-
-            Set<String> diffPaths = new LinkedHashSet<>();
-            collectDiffPaths(sourceBody, mutatedBody, "$", diffPaths);
-
-            assertFalse(diffPaths.isEmpty(), "Expected JSON body differences in mutated suggestion");
-            assertTrue(diffPaths.stream().allMatch(this::isTargetedPath),
-                    "Expected only targeted JSON fields to change, but got: " + diffPaths);
-
-            if (sourceBody.isObject() && mutatedBody.isObject()) {
-                assertEquals(sourceBody.path("method").asText(), mutatedBody.path("method").asText(),
-                        "Top-level method must remain unchanged");
-            }
+            ObjectNode export = suggestions.buildManualExportBundle(finding.suggestionId());
+            assertNotNull(export.path("curlCommand").asText(null));
+            assertTrue(export.path("bugcrowdMarkdown").asText("").contains("## Summary"));
+            assertTrue(export.path("bugcrowdMarkdown").asText("").contains("## Steps to Reproduce"));
         }
     }
 
     @Test
     void outOfScopeHostsProduceNoSuggestions() throws Exception {
+        String previous = System.getProperty(ALLOWED_HOSTS_PROPERTY);
+        System.setProperty(ALLOWED_HOSTS_PROPERTY, "allowed.example.com");
+
         JsonRpcIndex index = new JsonRpcIndex();
         NoopLogging logging = new NoopLogging();
         AuthContextStore authContextStore = new AuthContextStore(objectMapper);
 
-        try (SecurityAnalyzerService security = new SecurityAnalyzerService(objectMapper, index, authContextStore, logging);
-             WorkflowGraphService workflow = new WorkflowGraphService(objectMapper, logging);
-             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging);
-             AttackSuggestionService suggestions = new AttackSuggestionService(
-                     objectMapper,
-                     index,
-                     security,
-                     workflow,
-                     entityStore,
-                     authContextStore,
-                     logging
-             )) {
+        try {
+            try (SecurityAnalyzerService security = new SecurityAnalyzerService(objectMapper, index, authContextStore, logging);
+                 WorkflowGraphService workflow = new WorkflowGraphService(objectMapper, logging);
+                 EntityStoreService entityStore = new EntityStoreService(objectMapper, logging, authContextStore);
+                 AttackSuggestionService suggestions = new AttackSuggestionService(
+                         objectMapper,
+                         index,
+                         security,
+                         workflow,
+                         entityStore,
+                         authContextStore,
+                         logging
+                 )) {
 
-            JsonRpcRecord recordA = createRecord(
-                    "out-scope-a",
-                    "example.com",
-                    List.of("Cookie: sessionId=sid-a", "Authorization: Bearer token-a"),
-                    """
-                    {"jsonrpc":"2.0","method":"Device.Set","params":{"credentials":{"database":"db-a","sessionId":"sid-a","userName":"user-a"},"entity":{"deviceId":"d-a"}},"id":"a1"}
-                    """.trim(),
-                    200,
-                    """
-                    {"result":{"deviceId":"d-a","tenantId":"tenant-a"},"id":"a1"}
-                    """.trim()
-            );
+                JsonRpcRecord recordA = createStandardRecord(
+                        "out-a",
+                        "example.com",
+                        "Device.Get",
+                        "Device",
+                        "sid-a",
+                        "db-a",
+                        "user-a",
+                        "d-a",
+                        200,
+                        "{\"result\":[{\"id\":\"d-a\",\"typeName\":\"Device\"}],\"id\":1}"
+                );
 
-            JsonRpcRecord recordB = createRecord(
-                    "out-scope-b",
-                    "api.example.com",
-                    List.of("Cookie: sessionId=sid-b", "Authorization: Bearer token-b"),
-                    """
-                    {"jsonrpc":"2.0","method":"Device.Set","params":{"credentials":{"database":"db-b","sessionId":"sid-b","userName":"user-b"},"entity":{"deviceId":"d-b"}},"id":"b1"}
-                    """.trim(),
-                    200,
-                    """
-                    {"result":{"deviceId":"d-b","tenantId":"tenant-b"},"id":"b1"}
-                    """.trim()
-            );
+                JsonRpcRecord recordB = createStandardRecord(
+                        "out-b",
+                        "api.example.com",
+                        "Device.Get",
+                        "Device",
+                        "sid-b",
+                        "db-b",
+                        "user-b",
+                        "d-b",
+                        200,
+                        "{\"result\":[{\"id\":\"d-b\",\"typeName\":\"Device\"}],\"id\":1}"
+                );
 
-            ingest(index, security, workflow, entityStore, suggestions, recordA);
-            ingest(index, security, workflow, entityStore, suggestions, recordB);
+                ingest(index, security, workflow, entityStore, suggestions, authContextStore, recordA);
+                ingest(index, security, workflow, entityStore, suggestions, authContextStore, recordB);
 
-            authContextStore.setRoleForRecord(recordA.recordId(), RoleType.LOW_PRIV);
-            authContextStore.setRoleForRecord(recordB.recordId(), RoleType.ADMIN);
+                authContextStore.setRoleForRecord(recordA.recordId(), RoleType.LOW_PRIV);
+                authContextStore.setRoleForRecord(recordB.recordId(), RoleType.ADMIN);
 
-            suggestions.recomputeSync();
-
-            List<AttackSuggestion> rows = suggestions.snapshotSuggestions();
-            assertTrue(rows.isEmpty(), "Out-of-scope hosts must not produce suggestions");
+                suggestions.recomputeSync();
+                assertTrue(suggestions.snapshotSuggestions().isEmpty());
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(ALLOWED_HOSTS_PROPERTY);
+            } else {
+                System.setProperty(ALLOWED_HOSTS_PROPERTY, previous);
+            }
         }
     }
 
     @Test
-    void singleBatchAndNotificationJsonRpcRequestsAreHandled() throws Exception {
+    void realTrafficDetectsSearchEnumMulticallAndMethodAccess() throws Exception {
         JsonRpcIndex index = new JsonRpcIndex();
         NoopLogging logging = new NoopLogging();
         AuthContextStore authContextStore = new AuthContextStore(objectMapper);
 
         try (SecurityAnalyzerService security = new SecurityAnalyzerService(objectMapper, index, authContextStore, logging);
              WorkflowGraphService workflow = new WorkflowGraphService(objectMapper, logging);
-             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging);
+             EntityStoreService entityStore = new EntityStoreService(objectMapper, logging, authContextStore);
              AttackSuggestionService suggestions = new AttackSuggestionService(
-                     objectMapper,
-                     index,
-                     security,
-                     workflow,
-                     entityStore,
-                     authContextStore,
-                     logging
+                     objectMapper, index, security, workflow, entityStore, authContextStore, logging
              )) {
 
-            JsonRpcRecord single = createRecord(
-                    "single",
-                    "bugcrowd6.geotab.com",
-                    List.of("Cookie: sessionId=single-sid", "Authorization: Bearer single-token"),
-                    """
-                    {"jsonrpc":"2.0","method":"Device.Get","params":{"credentials":{"database":"db-single","sessionId":"single-sid","userName":"single.user"},"search":{"deviceId":"d-single"}},"id":"single-1"}
-                    """.trim(),
+            // ── Real traffic #1: Get:DeviceStatusInfo with broad search (no entity-ID constraint)
+            JsonRpcRecord lowDeviceStatus = createRawRecord(
+                    "low-device-status",
+                    "api.example.test",
+                    "{\"method\":\"Get\",\"params\":{\"typeName\":\"DeviceStatusInfo\",\"search\":{\"isDeviceCommunicating\":true},\"resultsLimit\":1,\"credentials\":{\"database\":\"sample_db_01\",\"sessionId\":\"low-sid\",\"userName\":\"low@example.test\",\"date\":\"2026-04-16T17:48:58.507Z\"}}}",
                     200,
-                    """
-                    {"result":{"deviceId":"d-single","tenantId":"tenant-single"},"id":"single-1"}
-                    """.trim()
+                    "{\"result\":[{\"id\":\"a1\",\"typeName\":\"DeviceStatusInfo\",\"device\":{\"id\":\"b1\"},\"isDeviceCommunicating\":true}],\"id\":1}"
             );
 
-            JsonRpcRecord batch = createRecord(
-                    "batch",
-                    "bugcrowd6.geotab.com",
-                    List.of("Cookie: sessionId=single-sid", "Authorization: Bearer single-token"),
-                    """
-                    [{"jsonrpc":"2.0","method":"ExecuteMultiCall","params":{"credentials":{"database":"db-single","sessionId":"single-sid","userName":"single.user"},"calls":[{"method":"Device.Get","params":{"search":{"deviceId":"d-single"}}}]},"id":"batch-1"}]
-                    """.trim(),
+            // ── Real traffic #2: ExecuteMultiCall with write sub-call (Add:Audit + GetDashboardItems)
+            JsonRpcRecord lowMultiCall = createRawRecord(
+                    "low-multicall",
+                    "api.example.test",
+                    "{\"method\":\"ExecuteMultiCall\",\"params\":{\"calls\":[{\"method\":\"Add\",\"params\":{\"typeName\":\"Audit\",\"entity\":{\"name\":\"DashboardView\"}}},{\"method\":\"GetDashboardItems\",\"params\":{}}],\"credentials\":{\"database\":\"sample_db_01\",\"sessionId\":\"low-sid\",\"userName\":\"low@example.test\",\"date\":\"2026-04-16T17:48:58.507Z\"}}}",
                     200,
-                    """
-                    [{"result":[{"deviceId":"d-single"}],"id":"batch-1"}]
-                    """.trim()
+                    "{\"result\":[[\"audit-1\"],[]],\"id\":3}"
             );
 
-            JsonRpcRecord notification = createRecord(
-                    "notification",
-                    "bugcrowd6.geotab.com",
-                    List.of("Cookie: sessionId=single-sid", "Authorization: Bearer single-token"),
-                    """
-                    {"jsonrpc":"2.0","method":"Device.Get","params":{"credentials":{"database":"db-single","sessionId":"single-sid","userName":"single.user"},"search":{"deviceId":"d-single"}}}
-                    """.trim(),
+            // ── Real traffic #3: GetReportSecurityIdentifiers (security-sensitive method)
+            // Once as LOW_PRIV
+            JsonRpcRecord lowSecurity = createRawRecord(
+                    "low-security-ids",
+                    "api.example.test",
+                    "{\"method\":\"GetReportSecurityIdentifiers\",\"params\":{\"credentials\":{\"database\":\"sample_db_01\",\"sessionId\":\"low-sid\",\"userName\":\"low@example.test\",\"date\":\"2026-04-16T17:48:58.507Z\"}}}",
                     200,
-                    """
-                    {"result":{"deviceId":"d-single"}}
-                    """.trim()
+                    "{\"result\":[{\"id\":\"sec-1\",\"name\":\"AllDevices\"}],\"id\":4}"
+            );
+            // Once as ADMIN (different session)
+            JsonRpcRecord adminSecurity = createRawRecord(
+                    "admin-security-ids",
+                    "api.example.test",
+                    "{\"method\":\"GetReportSecurityIdentifiers\",\"params\":{\"credentials\":{\"database\":\"sample_db_01\",\"sessionId\":\"admin-sid\",\"userName\":\"admin@example.test\",\"date\":\"2026-04-16T17:48:58.507Z\"}}}",
+                    200,
+                    "{\"result\":[{\"id\":\"sec-1\",\"name\":\"AllDevices\"},{\"id\":\"sec-2\",\"name\":\"AdminOnly\"}],\"id\":5}"
             );
 
-            JsonRpcNormalizedRecord singleNorm = parser.normalize(single);
-            JsonRpcNormalizedRecord batchNorm = parser.normalize(batch);
-            JsonRpcNormalizedRecord notificationNorm = parser.normalize(notification);
+            // Ingest all records
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, lowDeviceStatus);
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, lowMultiCall);
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, lowSecurity);
+            ingest(index, security, workflow, entityStore, suggestions, authContextStore, adminSecurity);
 
-            assertFalse(singleNorm.batchRequest());
-            assertTrue(batchNorm.batchRequest());
-            assertTrue(notificationNorm.notificationRequest());
-
-            ingest(index, security, workflow, entityStore, suggestions, single, singleNorm);
-            ingest(index, security, workflow, entityStore, suggestions, batch, batchNorm);
-            ingest(index, security, workflow, entityStore, suggestions, notification, notificationNorm);
-
-            authContextStore.setRoleForRecord(single.recordId(), RoleType.LOW_PRIV);
+            // Tag roles
+            authContextStore.setRoleForRecord(lowDeviceStatus.recordId(), RoleType.LOW_PRIV);
+            authContextStore.setRoleForRecord(lowMultiCall.recordId(), RoleType.LOW_PRIV);
+            authContextStore.setRoleForRecord(lowSecurity.recordId(), RoleType.LOW_PRIV);
+            authContextStore.setRoleForRecord(adminSecurity.recordId(), RoleType.ADMIN);
 
             suggestions.recomputeSync();
-            assertFalse(suggestions.snapshotSuggestions().isEmpty(),
-                    "Expected suggestions after processing single/batch/notification traffic");
+            List<AttackSuggestion> rows = suggestions.snapshotSuggestions();
+            assertFalse(rows.isEmpty(), "Expected findings from real traffic patterns");
+
+            Set<String> types = rows.stream().map(AttackSuggestion::findingType).collect(Collectors.toSet());
+
+            // SEARCH_ENUM: Get:DeviceStatusInfo with {isDeviceCommunicating:true} should fire
+            assertTrue(types.contains("SEARCH_ENUM"),
+                    "SEARCH_ENUM should fire for Get:DeviceStatusInfo with broad search. Found types: " + types);
+
+            // METHOD_ACCESS: GetReportSecurityIdentifiers seen by both ADMIN and LOW_PRIV
+            assertTrue(types.contains("METHOD_ACCESS"),
+                    "METHOD_ACCESS should fire for GetReportSecurityIdentifiers. Found types: " + types);
+
+            // MULTICALL_CHAIN: ExecuteMultiCall with Add (write) + GetDashboardItems (read)
+            assertTrue(types.contains("MULTICALL_CHAIN"),
+                    "MULTICALL_CHAIN should fire for ExecuteMultiCall with write sub-call. Found types: " + types);
         }
-    }
-
-    private Scenario seedAllowedHostScenario(
-            JsonRpcIndex index,
-            SecurityAnalyzerService security,
-            WorkflowGraphService workflow,
-            EntityStoreService entityStore,
-            AttackSuggestionService suggestions,
-            AuthContextStore authContextStore
-    ) throws Exception {
-        JsonRpcRecord lowPrivWrite = createRecord(
-                "low-write",
-                "bugcrowd5.geotab.com",
-                List.of("Cookie: sessionId=sid-low", "Authorization: Bearer low-token"),
-                """
-                {"jsonrpc":"2.0","method":"Device.Set","params":{"credentials":{"database":"db-low","sessionId":"sid-low","userName":"low.user"},"entity":{"deviceId":"d-low-1","groupId":"g-low"}},"id":"set-low-1"}
-                """.trim(),
-                200,
-                """
-                {"result":{"deviceId":"d-low-1","tenantId":"tenant-low"},"id":"set-low-1"}
-                """.trim()
-        );
-
-        JsonRpcRecord adminWrite = createRecord(
-                "admin-write",
-                "bugcrowd5.geotab.com",
-                List.of("Cookie: sessionId=sid-admin", "Authorization: Bearer admin-token"),
-                """
-                {"jsonrpc":"2.0","method":"Device.Set","params":{"credentials":{"database":"db-admin","sessionId":"sid-admin","userName":"admin.user"},"entity":{"deviceId":"d-admin-9","groupId":"g-admin"}},"id":"set-admin-1"}
-                """.trim(),
-                200,
-                """
-                {"result":{"deviceId":"d-admin-9","tenantId":"tenant-admin","groupId":"g-admin"},"id":"set-admin-1"}
-                """.trim()
-        );
-
-        JsonRpcRecord batchRequest = createRecord(
-                "batch",
-                "bugcrowd5.geotab.com",
-                List.of("Cookie: sessionId=sid-low", "Authorization: Bearer low-token"),
-                """
-                [{"jsonrpc":"2.0","method":"ExecuteMultiCall","params":{"credentials":{"database":"db-low","sessionId":"sid-low","userName":"low.user"},"calls":[{"method":"Device.Get","params":{"search":{"deviceId":"d-admin-9"}}},{"method":"Device.Set","params":{"entity":{"deviceId":"d-admin-9"}}}]},"id":"batch-1"}]
-                """.trim(),
-                200,
-                """
-                [{"result":[{"deviceId":"d-admin-9","tenantId":"tenant-admin"}],"id":"batch-1"}]
-                """.trim()
-        );
-
-        JsonRpcRecord positionalGet = createRecord(
-                "positional",
-                "bugcrowd5.geotab.com",
-                List.of("Cookie: sessionId=sid-low", "Authorization: Bearer low-token"),
-                """
-                {"jsonrpc":"2.0","method":"Device.Get","params":["d-low-1",{"database":"db-low"}],"id":"get-pos-1"}
-                """.trim(),
-                200,
-                """
-                {"result":{"deviceId":"d-low-1","tenantId":"tenant-low"},"id":"get-pos-1"}
-                """.trim()
-        );
-
-        JsonRpcRecord notificationGet = createRecord(
-                "notification",
-                "bugcrowd5.geotab.com",
-                List.of("Cookie: sessionId=sid-low", "Authorization: Bearer low-token"),
-                """
-                {"jsonrpc":"2.0","method":"Device.Get","params":{"credentials":{"database":"db-low","sessionId":"sid-low","userName":"low.user"},"search":{"deviceId":"d-low-1"}}}
-                """.trim(),
-                200,
-                """
-                {"result":{"deviceId":"d-low-1","tenantId":"tenant-low"}}
-                """.trim()
-        );
-
-        List<JsonRpcRecord> records = List.of(lowPrivWrite, adminWrite, batchRequest, positionalGet, notificationGet);
-        for (JsonRpcRecord record : records) {
-            ingest(index, security, workflow, entityStore, suggestions, record);
-        }
-
-        authContextStore.setRoleForRecord(adminWrite.recordId(), RoleType.ADMIN);
-        authContextStore.setRoleForRecord(lowPrivWrite.recordId(), RoleType.LOW_PRIV);
-        authContextStore.setRoleForRecord(batchRequest.recordId(), RoleType.LOW_PRIV);
-        authContextStore.setRoleForRecord(positionalGet.recordId(), RoleType.LOW_PRIV);
-
-        // Re-observe after role tagging so stored suggestion context reflects ADMIN/LOW_PRIV labels.
-        suggestions.ingestRecordAsync(lowPrivWrite, parser.normalize(lowPrivWrite), false);
-        suggestions.ingestRecordAsync(adminWrite, parser.normalize(adminWrite), false);
-        suggestions.ingestRecordAsync(batchRequest, parser.normalize(batchRequest), false);
-        suggestions.ingestRecordAsync(positionalGet, parser.normalize(positionalGet), false);
-        suggestions.ingestRecordAsync(notificationGet, parser.normalize(notificationGet), false);
-
-        suggestions.recomputeSync();
-        return new Scenario(records, suggestions.snapshotSuggestions());
     }
 
     private void ingest(
@@ -387,40 +315,59 @@ class AttackSuggestionServiceTest {
             WorkflowGraphService workflow,
             EntityStoreService entityStore,
             AttackSuggestionService suggestions,
+            AuthContextStore authContextStore,
             JsonRpcRecord record
     ) throws Exception {
         JsonRpcNormalizedRecord normalized = parser.normalize(record);
-        ingest(index, security, workflow, entityStore, suggestions, record, normalized);
-    }
-
-    private void ingest(
-            JsonRpcIndex index,
-            SecurityAnalyzerService security,
-            WorkflowGraphService workflow,
-            EntityStoreService entityStore,
-            AttackSuggestionService suggestions,
-            JsonRpcRecord record,
-            JsonRpcNormalizedRecord normalized
-    ) {
-        index.addRecord(normalized, record);
+        AuthContextStore.AuthContext context = authContextStore.observeRecord(record, normalized.methodName());
+        index.addRecord(normalized, record, context.contextKey());
         security.ingestRecordSync(record, normalized);
         workflow.ingestRecordSync(record, normalized);
         entityStore.ingestRecordSync(record, normalized);
         suggestions.ingestRecordAsync(record, normalized, false);
     }
 
-    private JsonRpcRecord createRecord(
+    private JsonRpcRecord createStandardRecord(
             String recordIdSeed,
             String host,
-            List<String> extraHeaders,
+            String method,
+            String typeName,
+            String sessionId,
+            String database,
+            String userName,
+            String entityId,
+            Integer responseStatus,
+            String responseBody
+    ) {
+        String requestBody = "{"
+                + "\"jsonrpc\":\"2.0\","
+                + "\"method\":\"" + method + "\","
+                + "\"params\":{"
+                + "\"typeName\":\"" + typeName + "\","
+                + "\"search\":{\"id\":\"" + entityId + "\"},"
+                + "\"credentials\":{"
+                + "\"database\":\"" + database + "\","
+                + "\"sessionId\":\"" + sessionId + "\","
+                + "\"userName\":\"" + userName + "\""
+                + "}"
+                + "},"
+                + "\"id\":1"
+                + "}";
+
+        return createRawRecord(recordIdSeed, host, requestBody, responseStatus, responseBody);
+    }
+
+    private JsonRpcRecord createRawRecord(
+            String recordIdSeed,
+            String host,
             String requestBody,
             Integer responseStatus,
             String responseBody
     ) {
-        List<String> headers = new ArrayList<>();
-        headers.add("Host: " + host);
-        headers.addAll(extraHeaders);
-        headers.add("Content-Type: application/json");
+        List<String> headers = List.of(
+                "Host: " + host,
+                "Content-Type: application/json"
+        );
 
         String rawRequest = "POST /apiv1 HTTP/1.1\r\n"
                 + String.join("\r\n", headers)
@@ -458,152 +405,6 @@ class AttackSuggestionServiceTest {
                 requestData,
                 responseData
         );
-    }
-
-    private boolean hasFamily(List<AttackSuggestion> suggestions, String family) {
-        return suggestions.stream().anyMatch(suggestion -> matchesFamily(suggestion, family));
-    }
-
-    private boolean matchesFamily(AttackSuggestion suggestion, String family) {
-        String corpus = (suggestion.category() + " " + suggestion.findingTitle() + " "
-                + suggestion.attackPath() + " " + suggestion.observation() + " " + suggestion.whySuspicious())
-                .toLowerCase(Locale.ROOT);
-
-        return switch (family) {
-            case "cross-tenant" -> corpus.contains("cross-tenant") || corpus.contains("cross-database");
-            case "auth" -> corpus.contains("auth") || corpus.contains("authorization");
-            case "privilege" -> corpus.contains("privilege");
-            case "batch" -> corpus.contains("batch") || corpus.contains("multicall");
-            case "notification" -> corpus.contains("notification");
-            case "param-mutation" -> corpus.contains("named->")
-                    || corpus.contains("positional->")
-                    || corpus.contains("nested param")
-                    || corpus.contains("param encoding");
-            default -> false;
-        };
-    }
-
-    private ParsedHttpRequest parseRequest(String rawRequest) {
-        String normalized = rawRequest.contains("\\r\\n") && !rawRequest.contains("\r\n")
-                ? rawRequest.replace("\\r\\n", "\r\n")
-                : rawRequest;
-
-        int split = normalized.indexOf("\r\n\r\n");
-        int separatorLength = 4;
-        if (split < 0) {
-            split = normalized.indexOf("\n\n");
-            separatorLength = 2;
-        }
-
-        String head = split >= 0 ? normalized.substring(0, split) : normalized;
-        String body = split >= 0 ? normalized.substring(split + separatorLength) : "";
-
-        String[] lines = head.split("\\r?\\n");
-        String requestLine = lines.length > 0 ? lines[0] : "";
-
-        Map<String, String> headers = new LinkedHashMap<>();
-        for (int i = 1; i < lines.length; i++) {
-            String line = lines[i];
-            int colon = line.indexOf(':');
-            if (colon < 1) {
-                continue;
-            }
-            String name = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
-            String value = line.substring(colon + 1).trim();
-            headers.put(name, value);
-        }
-
-        return new ParsedHttpRequest(requestLine, headers, body);
-    }
-
-    private void collectDiffPaths(JsonNode left, JsonNode right, String path, Set<String> out) {
-        boolean leftMissing = left == null || left.isMissingNode();
-        boolean rightMissing = right == null || right.isMissingNode();
-
-        if (leftMissing && rightMissing) {
-            return;
-        }
-        if (leftMissing || rightMissing) {
-            out.add(path);
-            return;
-        }
-
-        if (left.getNodeType() != right.getNodeType()) {
-            out.add(path);
-            return;
-        }
-
-        if (left.isValueNode()) {
-            if (!left.equals(right)) {
-                out.add(path);
-            }
-            return;
-        }
-
-        if (left.isObject()) {
-            Set<String> keys = new LinkedHashSet<>();
-            left.fieldNames().forEachRemaining(keys::add);
-            right.fieldNames().forEachRemaining(keys::add);
-            for (String key : keys) {
-                collectDiffPaths(left.get(key), right.get(key), path + "." + key, out);
-            }
-            return;
-        }
-
-        if (left.isArray()) {
-            int max = Math.max(left.size(), right.size());
-            for (int i = 0; i < max; i++) {
-                JsonNode leftChild = i < left.size() ? left.get(i) : null;
-                JsonNode rightChild = i < right.size() ? right.get(i) : null;
-                collectDiffPaths(leftChild, rightChild, path + "[" + i + "]", out);
-            }
-        }
-    }
-
-    private boolean isTargetedPath(String path) {
-        if ("$.id".equals(path)) {
-            return true;
-        }
-        if (path.startsWith("$.params")) {
-            return true;
-        }
-
-        String normalized = path.replaceAll("\\[\\d+\\]", "[]");
-        if ("$[].id".equals(normalized)) {
-            return true;
-        }
-        return normalized.startsWith("$[].params") || normalized.contains(".params.");
-    }
-
-    private String methodFingerprint(JsonNode body) {
-        if (body == null || body.isNull() || body.isMissingNode()) {
-            return "";
-        }
-
-        if (body.isObject()) {
-            return "obj:" + body.path("method").asText("");
-        }
-
-        if (body.isArray()) {
-            List<String> methods = new ArrayList<>();
-            for (JsonNode item : body) {
-                if (item != null && item.isObject()) {
-                    methods.add(item.path("method").asText(""));
-                }
-            }
-            return "arr:" + String.join("|", methods);
-        }
-
-        return body.getNodeType().name().toLowerCase(Locale.ROOT);
-    }
-
-    private record ParsedHttpRequest(String requestLine, Map<String, String> headers, String body) {
-        private String header(String name) {
-            return headers.get(name.toLowerCase(Locale.ROOT));
-        }
-    }
-
-    private record Scenario(List<JsonRpcRecord> records, List<AttackSuggestion> suggestions) {
     }
 
     private static final class NoopLogging implements Logging {

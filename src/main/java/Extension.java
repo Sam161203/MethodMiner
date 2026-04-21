@@ -9,6 +9,7 @@ public class Extension implements BurpExtension {
     private WorkflowGraphService workflowGraphService;
     private EntityStoreService entityStoreService;
     private AttackSuggestionService attackSuggestionService;
+    private AttackExecutionService attackExecutionService;
     private AuthContextStore authContextStore;
     private LogicHunterExportService exportService;
     private Registration httpHandlerRegistration;
@@ -43,6 +44,14 @@ public class Extension implements BurpExtension {
             authContextStore,
             montoyaApi.logging()
         );
+        attackExecutionService = AttackExecutionService.create(
+                montoyaApi,
+                objectMapper,
+                authContextStore,
+                entityStoreService,
+                index
+        );
+        attackSuggestionService.setAttackExecutionService(attackExecutionService);
             exportService = new LogicHunterExportService(
                 objectMapper,
                 authContextStore,

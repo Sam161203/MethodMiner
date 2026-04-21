@@ -553,6 +553,7 @@ public final class JsonRpcTab extends JPanel {
                 switch (roleType) {
                     case ADMIN -> component.setForeground(new Color(0, 128, 0));
                     case LOW_PRIV -> component.setForeground(new Color(194, 112, 0));
+                    case MIXED -> component.setForeground(new Color(0, 102, 153));
                     case UNKNOWN -> component.setForeground(new Color(120, 120, 120));
                 }
             } else {

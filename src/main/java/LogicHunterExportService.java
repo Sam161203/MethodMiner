@@ -42,7 +42,9 @@ public final class LogicHunterExportService {
         root.set("methods", exportMethods(null));
         root.set("entities", exportEntities(null));
         root.set("findings", exportFindings(null));
-        root.set("attackSuggestions", exportAttackSuggestions(null));
+        ArrayNode attackSuggestions = exportAttackSuggestions(null);
+        root.set("attackSuggestions", attackSuggestions);
+        root.put("bugcrowdMarkdownReport", buildBugcrowdMarkdownReport(attackSuggestions));
         root.set("workflowChains", exportWorkflowChains(null));
 
         return root;
@@ -57,7 +59,9 @@ public final class LogicHunterExportService {
         root.set("methods", exportMethods(methodName));
         root.set("entities", exportEntities(methodName));
         root.set("findings", exportFindings(methodName));
-        root.set("attackSuggestions", exportAttackSuggestions(methodName));
+        ArrayNode attackSuggestions = exportAttackSuggestions(methodName);
+        root.set("attackSuggestions", attackSuggestions);
+        root.put("bugcrowdMarkdownReport", buildBugcrowdMarkdownReport(attackSuggestions));
         root.set("workflowChains", exportWorkflowChains(methodName));
 
         return root;
@@ -72,8 +76,6 @@ public final class LogicHunterExportService {
             node.put("sessionId", safe(context.sessionId()));
             node.put("role", context.role() == null ? RoleType.UNKNOWN.displayName() : context.role().displayName());
             node.put("contextKey", safe(context.contextKey()));
-            node.put("authorization", safe(context.rawAuthorizationHeader()));
-            node.put("cookie", safe(context.rawCookieHeader()));
             node.put("lastSeenUrl", safe(context.lastSeenUrl()));
             contexts.add(node);
         }
@@ -211,6 +213,7 @@ public final class LogicHunterExportService {
             node.put("impact", suggestion.impact());
             node.put("evidence", suggestion.evidence());
             node.put("formattedFinding", suggestion.toFormattedFinding());
+            node.put("bugcrowdMarkdown", suggestion.bugcrowdMarkdown());
 
             // Include full request context for copy-paste
             try {
@@ -255,6 +258,29 @@ public final class LogicHunterExportService {
             chains.add(node);
         }
         return chains;
+    }
+
+    private String buildBugcrowdMarkdownReport(ArrayNode suggestions) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("# LogicHunter Bugcrowd Report\n\n");
+        builder.append("Generated: ").append(Instant.now()).append("\n\n");
+
+        int findingIndex = 0;
+        for (int i = 0; i < suggestions.size(); i++) {
+            String markdown = suggestions.get(i).path("bugcrowdMarkdown").asText("").trim();
+            if (markdown.isBlank()) {
+                continue;
+            }
+            findingIndex++;
+            builder.append("## Finding ").append(findingIndex).append("\n\n");
+            builder.append(markdown).append("\n\n");
+        }
+
+        if (findingIndex == 0) {
+            builder.append("No findings available.\n");
+        }
+
+        return builder.toString();
     }
 
     private static List<String> nullSafe(List<String> values) {

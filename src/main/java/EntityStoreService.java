@@ -4,9 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-import java.net.URI;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -19,7 +16,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -28,16 +24,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.regex.Pattern;
 
 public final class EntityStoreService implements AutoCloseable {
     private static final int MAX_METHODS_PER_ENTITY = 80;
     private static final int MAX_CONTEXTS_PER_ENTITY = 80;
-    private static final int MAX_PATHS_PER_ENTITY = 40;
     private static final int MAX_SAMPLES_PER_ENTITY = 24;
     private static final long NOTIFY_INTERVAL_MILLIS = 500L;
-
-    private static final Pattern EMAIL_PATTERN = Pattern.compile("(?i)^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$");
 
     private final ObjectMapper objectMapper;
     private final Logging logging;
@@ -88,29 +80,42 @@ public final class EntityStoreService implements AutoCloseable {
             return;
         }
 
-        String authContext = authContextStore == null
-            ? authContextFingerprint(rawRecord)
-            : authContextStore.observeRecord(rawRecord, normalizedRecord.methodName()).contextKey();
-        List<EntityOccurrence> requestValues = extractEntityOccurrences(rawRecord.request().bodyText(), ValueOrigin.REQUEST);
-        List<EntityOccurrence> responseValues = extractEntityOccurrences(rawRecord.response().bodyText(), ValueOrigin.RESPONSE);
+        AuthContextStore.AuthContext context = authContextStore == null
+                ? AuthContextStore.AuthContext.unknown("unknown-session")
+                : authContextStore.lookupContext(rawRecord.request().bodyText(), rawRecord.request().url());
 
-        List<EntityOccurrence> allValues = new ArrayList<>(requestValues.size() + responseValues.size());
-        allValues.addAll(requestValues);
-        allValues.addAll(responseValues);
+        List<ExtractedEntity> extracted = extractEntities(
+            rawRecord.request().bodyText(),
+                rawRecord.response().bodyText(),
+                normalizedRecord.typeName(),
+                defaultIfBlank(context.database(), "unknown-db"),
+            defaultIfBlank(context.contextKey(), "")
+        );
 
-        for (EntityOccurrence occurrence : allValues) {
-            entities.computeIfAbsent(occurrence.canonicalValue(), key -> new EntityAggregate(
-                    occurrence.canonicalValue(),
-                    occurrence.preview(),
-                    occurrence.entityType()
-            )).observe(
-                    occurrence,
-                    normalizedRecord.methodName(),
-                    authContext,
-                    normalizedRecord.timestamp(),
-                    normalizedRecord.responseStatus()
-            );
+        for (ExtractedEntity entity : extracted) {
+            entities.compute(entity.entityId(), (ignored, existing) -> {
+                EntityAggregate aggregate = existing == null ? new EntityAggregate(entity.entityId()) : existing;
+                aggregate.observe(entity, normalizedRecord.methodName(), normalizedRecord.timestamp());
+                return aggregate;
+            });
         }
+    }
+
+    public List<ExtractedEntity> snapshotExtractedEntities() {
+        List<ExtractedEntity> out = new ArrayList<>();
+        for (EntityAggregate aggregate : entities.values()) {
+            out.add(aggregate.toExtractedEntity());
+        }
+        out.sort(Comparator.comparing(ExtractedEntity::entityId, String.CASE_INSENSITIVE_ORDER));
+        return out;
+    }
+
+    public Optional<ExtractedEntity> snapshotExtractedEntity(String entityId) {
+        if (entityId == null || entityId.isBlank()) {
+            return Optional.empty();
+        }
+        EntityAggregate aggregate = entities.get(entityId);
+        return aggregate == null ? Optional.empty() : Optional.of(aggregate.toExtractedEntity());
     }
 
     public List<EntityRow> snapshotRows() {
@@ -121,7 +126,7 @@ public final class EntityStoreService implements AutoCloseable {
 
         rows.sort(Comparator
                 .comparingInt(EntityRow::riskScore).reversed()
-                .thenComparingInt(EntityRow::uniqueMethods).reversed()
+            .thenComparingInt(EntityRow::authContexts).reversed()
                 .thenComparingLong(EntityRow::observations).reversed()
                 .thenComparing(EntityRow::preview, String.CASE_INSENSITIVE_ORDER));
         return rows;
@@ -261,262 +266,11 @@ public final class EntityStoreService implements AutoCloseable {
         }
     }
 
-    private List<EntityOccurrence> extractEntityOccurrences(String body, ValueOrigin origin) {
-        if (body == null || body.isBlank()) {
-            return List.of();
-        }
-
-        final JsonNode root;
-        try {
-            root = objectMapper.readTree(body);
-        } catch (Exception ignored) {
-            return List.of();
-        }
-
-        List<EntityOccurrence> out = new ArrayList<>();
-        visitNode(root, "$", "", origin, out);
-        return out;
-    }
-
-    private void visitNode(JsonNode node, String path, String keyName, ValueOrigin origin, List<EntityOccurrence> out) {
-        if (node == null) {
-            return;
-        }
-
-        if (node.isObject()) {
-            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> field = fields.next();
-                String childKey = field.getKey();
-                String childPath = "$".equals(path) ? "$." + childKey : path + "." + childKey;
-                JsonNode child = field.getValue();
-
-                addOccurrenceIfCandidate(child, childPath, childKey, origin, out);
-                visitNode(child, childPath, childKey, origin, out);
-            }
-            return;
-        }
-
-        if (node.isArray()) {
-            for (int i = 0; i < node.size(); i++) {
-                JsonNode child = node.get(i);
-                String arrayKey = keyName.isBlank() ? "array" : keyName + "[]";
-                String childPath = path + "[" + i + "]";
-
-                addOccurrenceIfCandidate(child, childPath, arrayKey, origin, out);
-                visitNode(child, childPath, arrayKey, origin, out);
-            }
-        }
-    }
-
-    private void addOccurrenceIfCandidate(
-            JsonNode node,
-            String path,
-            String keyName,
-            ValueOrigin origin,
-            List<EntityOccurrence> out
-    ) {
-        if (node == null) {
-            return;
-        }
-
-        String loweredKey = keyName == null ? "" : keyName.toLowerCase(Locale.ROOT);
-        if ("jsonrpc".equals(loweredKey) || "method".equals(loweredKey)) {
-            return;
-        }
-        if ("$.id".equals(path)) {
-            return;
-        }
-
-        if (node.isValueNode()) {
-            String canonical = canonicalizeScalar(node, loweredKey, path);
-            if (canonical == null) {
-                return;
-            }
-
-            EntityType entityType = classifyEntityType(loweredKey, path, canonical);
-            String preview = preview(canonical);
-            out.add(new EntityOccurrence(canonical, preview, path, entityType, origin));
-            return;
-        }
-
-        if ((node.isObject() || node.isArray()) && shouldTrackObjectReference(loweredKey, node)) {
-            String serialized = node.toString();
-            String canonical = "objref:" + shortHash(serialized);
-            String preview = "object-ref:" + shortHash(serialized);
-            out.add(new EntityOccurrence(canonical, preview, path, EntityType.OBJECT_REFERENCE, origin));
-        }
-    }
-
-    private static String canonicalizeScalar(JsonNode node, String loweredKey, String path) {
-        if (node.isNull() || node.isBoolean()) {
-            return null;
-        }
-
-        final String raw;
-        if (node.isTextual()) {
-            raw = node.asText("").trim();
-        } else if (node.isNumber()) {
-            raw = node.asText("");
-        } else {
-            return null;
-        }
-
-        if (raw.isBlank()) {
-            return null;
-        }
-
-        boolean idLike = isIdLikeKey(loweredKey) || path.endsWith(".id") || path.contains("_id");
-        if (!idLike && raw.length() < 4) {
-            return null;
-        }
-
-        if (!idLike && raw.contains(" ") && raw.length() > 48) {
-            return null;
-        }
-
-        String canonical = raw;
-        if (EMAIL_PATTERN.matcher(canonical).matches()) {
-            canonical = canonical.toLowerCase(Locale.ROOT);
-        }
-
-        if (!idLike && canonical.length() > 140) {
-            canonical = "hash:" + shortHash(canonical);
-        }
-
-        return canonical;
-    }
-
-    private static boolean shouldTrackObjectReference(String loweredKey, JsonNode node) {
-        if (loweredKey == null || loweredKey.isBlank()) {
-            return false;
-        }
-
-        boolean referenceHint = loweredKey.contains("ref")
-                || loweredKey.contains("object")
-                || loweredKey.contains("item")
-                || loweredKey.contains("entity");
-
-        if (!referenceHint) {
-            return false;
-        }
-
-        if (node.isObject()) {
-            return node.size() > 0 && node.size() <= 14;
-        }
-
-        if (node.isArray()) {
-            return node.size() > 0 && node.size() <= 10;
-        }
-
-        return false;
-    }
-
-    private static EntityType classifyEntityType(String loweredKey, String path, String value) {
-        if (loweredKey.contains("tenant") || loweredKey.contains("organization") || loweredKey.contains("org")) {
-            return EntityType.TENANT_ID;
-        }
-        if (loweredKey.contains("user") || loweredKey.contains("login")) {
-            return EntityType.USER_ID;
-        }
-        if (loweredKey.contains("account") || loweredKey.contains("customer") || loweredKey.contains("billing")) {
-            return EntityType.ACCOUNT_ID;
-        }
-        if (loweredKey.contains("order")) {
-            return EntityType.ORDER_ID;
-        }
-        if (loweredKey.contains("device")) {
-            return EntityType.DEVICE_ID;
-        }
-        if (loweredKey.contains("report") || loweredKey.contains("export")) {
-            return EntityType.REPORT_ID;
-        }
-        if (loweredKey.contains("session") || loweredKey.contains("token") || loweredKey.contains("jwt") || loweredKey.contains("auth")) {
-            return EntityType.SESSION_TOKEN;
-        }
-        if (loweredKey.contains("email") || EMAIL_PATTERN.matcher(value).matches()) {
-            return EntityType.EMAIL;
-        }
-        if (loweredKey.contains("ref") || loweredKey.contains("object")) {
-            return EntityType.OBJECT_REFERENCE;
-        }
-
-        if (isIdLikeKey(loweredKey) || path.endsWith(".id") || path.contains("_id")) {
-            return EntityType.GENERIC_ID;
-        }
-
-        return EntityType.OTHER;
-    }
-
-    private static boolean isIdLikeKey(String loweredKey) {
-        if (loweredKey == null || loweredKey.isBlank()) {
-            return false;
-        }
-        return loweredKey.equals("id")
-                || loweredKey.endsWith("id")
-                || loweredKey.contains("_id")
-                || loweredKey.contains("tenant")
-                || loweredKey.contains("user")
-                || loweredKey.contains("account")
-                || loweredKey.contains("order")
-                || loweredKey.contains("device")
-                || loweredKey.contains("report")
-                || loweredKey.contains("session")
-                || loweredKey.contains("token")
-                || loweredKey.contains("ref");
-    }
-
-    private static String authContextFingerprint(JsonRpcRecord rawRecord) {
-        String host = extractHost(rawRecord.request().url());
-        String authScheme = "none";
-        String cookieHash = "none";
-
-        List<String> headers = rawRecord.request().headers();
-        StringBuilder cookieMaterial = new StringBuilder();
-        for (String header : headers) {
-            if (header == null || header.isBlank()) {
-                continue;
-            }
-            String lowered = header.toLowerCase(Locale.ROOT);
-            if (lowered.startsWith("authorization:")) {
-                int split = header.indexOf(':');
-                String value = split > -1 ? header.substring(split + 1).trim() : "";
-                authScheme = value.contains(" ") ? value.substring(0, value.indexOf(' ')) : value;
-                if (authScheme.isBlank()) {
-                    authScheme = "present";
-                }
-            }
-            if (lowered.startsWith("cookie:")) {
-                cookieMaterial.append(header.trim()).append('|');
-            }
-        }
-
-        if (!cookieMaterial.isEmpty()) {
-            cookieHash = shortHash(cookieMaterial.toString());
-        }
-
-        return "host=" + defaultIfBlank(host, "unknown")
-                + "|auth=" + defaultIfBlank(authScheme, "none")
-                + "|cookie=" + defaultIfBlank(cookieHash, "none");
-    }
-
-    private static String extractHost(String url) {
-        if (url == null || url.isBlank()) {
-            return "";
-        }
-        try {
-            URI uri = URI.create(url);
-            return uri.getHost() == null ? "" : uri.getHost();
-        } catch (Exception ignored) {
-            return "";
-        }
-    }
-
     private static List<String> manualTestPlan(EntityDetails details) {
         List<String> plan = new ArrayList<>();
         plan.add("Capture at least two authenticated contexts (for example user A and user B) in Burp Proxy.");
-        plan.add("Replay a producer request to obtain fresh identifiers from context A.");
-        plan.add("Use Repeater to inject the same identifier into consumer methods under context B.");
+        plan.add("Capture an entity ID from admin or higher-privileged session responses.");
+        plan.add("Replay with LOW_PRIV credentials while keeping method and search shape unchanged.");
         if (details.row().crossContextReuse()) {
             plan.add("Because this entity was seen across multiple auth contexts, prioritize ownership validation and tenant-boundary checks.");
         }
@@ -527,43 +281,274 @@ public final class EntityStoreService implements AutoCloseable {
         return plan;
     }
 
-    private static String shortHash(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder builder = new StringBuilder();
-            for (int i = 0; i < 8; i++) {
-                builder.append(String.format("%02x", hash[i]));
-            }
-            return builder.toString();
-        } catch (Exception ignored) {
-            return Integer.toHexString(value.hashCode());
-        }
-    }
-
-    private static String preview(String value) {
-        if (value == null || value.isBlank()) {
-            return "";
-        }
-        return value.length() <= 72 ? value : value.substring(0, 72) + "...";
-    }
-
     private static String defaultIfBlank(String value, String fallback) {
         return value == null || value.isBlank() ? fallback : value;
     }
 
-    private enum ValueOrigin {
+    private List<ExtractedEntity> extractEntities(
+            String requestBody,
+            String responseBody,
+            String fallbackTypeName,
+            String database,
+            String contextKey
+    ) {
+        List<ExtractedEntity> out = new ArrayList<>();
+        LinkedHashSet<String> dedupe = new LinkedHashSet<>();
+
+        JsonNode requestRoot = parseJson(requestBody);
+        if (requestRoot != null) {
+            collectRequestEntities(requestRoot, fallbackTypeName, database, contextKey, out, dedupe);
+        }
+
+        JsonNode responseRoot = parseJson(responseBody);
+        if (responseRoot != null) {
+            collectResponseEntities(responseRoot, fallbackTypeName, database, contextKey, out, dedupe);
+        }
+
+        return List.copyOf(out);
+    }
+
+    private JsonNode parseJson(String payload) {
+        if (payload == null || payload.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readTree(payload);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void collectRequestEntities(
+            JsonNode requestRoot,
+            String fallbackTypeName,
+            String database,
+            String contextKey,
+            List<ExtractedEntity> out,
+            Set<String> dedupe
+    ) {
+        if (requestRoot.isObject()) {
+            JsonNode params = requestRoot.path("params");
+            if (!params.isMissingNode() && !params.isNull()) {
+                collectIdLikeValues(
+                        params,
+                        "$.params",
+                        fallbackTypeName,
+                        database,
+                        contextKey,
+                        ExtractionSource.REQUEST,
+                        out,
+                        dedupe,
+                        0
+                );
+            }
+        }
+
+        if (requestRoot.isArray()) {
+            for (int i = 0; i < requestRoot.size(); i++) {
+                JsonNode call = requestRoot.get(i);
+                if (call == null || !call.isObject()) {
+                    continue;
+                }
+                JsonNode params = call.path("params");
+                if (params.isMissingNode() || params.isNull()) {
+                    continue;
+                }
+                collectIdLikeValues(
+                        params,
+                        "$.calls[" + i + "].params",
+                        fallbackTypeName,
+                        database,
+                        contextKey,
+                        ExtractionSource.REQUEST,
+                        out,
+                        dedupe,
+                        0
+                );
+            }
+        }
+    }
+
+    private void collectResponseEntities(
+            JsonNode responseRoot,
+            String fallbackTypeName,
+            String database,
+            String contextKey,
+            List<ExtractedEntity> out,
+            Set<String> dedupe
+    ) {
+        JsonNode resultNode = responseRoot.path("result");
+        if (resultNode.isMissingNode() || resultNode.isNull()) {
+            resultNode = responseRoot.path("data");
+        }
+        if (resultNode.isMissingNode() || resultNode.isNull()) {
+            resultNode = responseRoot;
+        }
+
+        collectIdLikeValues(
+                resultNode,
+                "$.result",
+                fallbackTypeName,
+                database,
+                contextKey,
+                ExtractionSource.RESPONSE,
+                out,
+                dedupe,
+                0
+        );
+    }
+
+    private void collectIdLikeValues(
+            JsonNode node,
+            String path,
+            String fallbackTypeName,
+            String database,
+            String contextKey,
+            ExtractionSource source,
+            List<ExtractedEntity> out,
+            Set<String> dedupe,
+            int depth
+    ) {
+        if (node == null || node.isNull() || node.isMissingNode() || depth > 10 || out.size() >= 300) {
+            return;
+        }
+
+        if (node.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext() && out.size() < 300) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                String key = entry.getKey() == null ? "" : entry.getKey();
+                JsonNode value = entry.getValue();
+                String childPath = path + "." + key;
+
+                if (source == ExtractionSource.REQUEST && "credentials".equalsIgnoreCase(key)) {
+                    continue;
+                }
+
+                if (isIdLikeKey(key) && isUsefulScalar(value)) {
+                    String entityId = asText(value);
+                    if (!entityId.isBlank()) {
+                        String dedupeKey = source + "|" + childPath + "|" + entityId;
+                        if (dedupe.add(dedupeKey)) {
+                            String typeName = inferTypeNameFromKey(key, fallbackTypeName);
+                            out.add(new ExtractedEntity(
+                                    entityId,
+                                    typeName,
+                                    defaultIfBlank(database, "unknown-db"),
+                                    defaultIfBlank(contextKey, ""),
+                                    key,
+                                    false,
+                                    source.name().toLowerCase(Locale.ROOT) + ":" + childPath,
+                                    List.of(defaultIfBlank(contextKey, ""))
+                            ));
+                        }
+                    }
+                }
+
+                collectIdLikeValues(value, childPath, fallbackTypeName, database, contextKey, source, out, dedupe, depth + 1);
+            }
+            return;
+        }
+
+        if (node.isArray()) {
+            for (int i = 0; i < node.size() && out.size() < 300; i++) {
+                collectIdLikeValues(
+                        node.get(i),
+                        path + "[" + i + "]",
+                        fallbackTypeName,
+                        database,
+                        contextKey,
+                        source,
+                        out,
+                        dedupe,
+                        depth + 1
+                );
+            }
+        }
+    }
+
+    private static boolean isUsefulScalar(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return false;
+        }
+        if (!(node.isTextual() || node.isNumber() || node.isBoolean())) {
+            return false;
+        }
+
+        String value = asText(node);
+        return !value.isBlank() && value.length() <= 160;
+    }
+
+    private static boolean isIdLikeKey(String key) {
+        if (key == null || key.isBlank()) {
+            return false;
+        }
+
+        String lowered = key.toLowerCase(Locale.ROOT);
+        if ("sessionid".equals(lowered)
+                || "database".equals(lowered)
+                || "db".equals(lowered)
+                || "username".equals(lowered)
+                || "token".equals(lowered)
+                || "authorization".equals(lowered)) {
+            return false;
+        }
+
+        return lowered.equals("id")
+                || lowered.endsWith("id")
+                || lowered.contains("_id")
+                || lowered.contains("entity")
+                || lowered.contains("tenant")
+                || lowered.contains("user")
+                || lowered.contains("group")
+                || lowered.contains("device")
+                || lowered.contains("report")
+                || lowered.contains("rule")
+                || lowered.contains("order")
+                || lowered.contains("account")
+                || lowered.contains("organization")
+            || lowered.contains("org")
+            || lowered.contains("policy")
+            || lowered.contains("asset")
+            || lowered.contains("driver")
+            || lowered.contains("zone")
+            || lowered.contains("company");
+    }
+
+    private static String inferTypeNameFromKey(String key, String fallbackTypeName) {
+        if (key == null || key.isBlank()) {
+            return defaultIfBlank(fallbackTypeName, "Unknown");
+        }
+
+        String lowered = key.toLowerCase(Locale.ROOT);
+        if (lowered.contains("tenant") || lowered.contains("organization") || lowered.contains("org")) {
+            return "Tenant";
+        }
+        if (lowered.contains("user") || lowered.contains("email")) {
+            return "User";
+        }
+        if (lowered.contains("device")) {
+            return "Device";
+        }
+        if (lowered.contains("report")) {
+            return "Report";
+        }
+        if (lowered.contains("group") || lowered.contains("account")) {
+            return "Account";
+        }
+        return defaultIfBlank(fallbackTypeName, "Unknown");
+    }
+
+    private enum ExtractionSource {
         REQUEST,
         RESPONSE
     }
 
-    private record EntityOccurrence(
-            String canonicalValue,
-            String preview,
-            String path,
-            EntityType entityType,
-            ValueOrigin origin
-    ) {
+    private static String asText(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return "";
+        }
+        return node.asText("").trim();
     }
 
     public enum EntityType {
@@ -597,34 +582,29 @@ public final class EntityStoreService implements AutoCloseable {
     }
 
     private static final class EntityAggregate {
-        private final String entityKey;
-        private final String preview;
-        private final EntityType entityType;
+        private final String entityId;
 
         private long observations;
         private Instant firstSeen;
         private Instant lastSeen;
+        private String typeName = "Unknown";
+        private String database = "unknown-db";
+        private String name = "";
+        private boolean isGlobalReportingGroup;
+        private String raw = "";
 
-        private final Set<String> methods = new TreeSet<>();
-        private final Set<String> producerMethods = new TreeSet<>();
-        private final Set<String> consumerMethods = new TreeSet<>();
-        private final Set<String> authContexts = new TreeSet<>();
-        private final Set<Integer> statuses = new TreeSet<>();
-        private final LimitedSet<String> paths = new LimitedSet<>(MAX_PATHS_PER_ENTITY);
+        private final Set<String> methods = new LinkedHashSet<>();
+        private final Set<String> seenContexts = new LinkedHashSet<>();
         private final ArrayDeque<String> samples = new ArrayDeque<>();
 
-        private EntityAggregate(String entityKey, String preview, EntityType entityType) {
-            this.entityKey = entityKey;
-            this.preview = preview;
-            this.entityType = entityType;
+        private EntityAggregate(String entityId) {
+            this.entityId = entityId;
         }
 
         synchronized void observe(
-                EntityOccurrence occurrence,
+                ExtractedEntity entity,
                 String methodName,
-                String authContext,
-                Instant timestamp,
-                Integer statusCode
+                Instant timestamp
         ) {
             observations++;
 
@@ -635,46 +615,48 @@ public final class EntityStoreService implements AutoCloseable {
                 lastSeen = timestamp;
             }
 
+            this.typeName = defaultIfBlank(entity.typeName(), this.typeName);
+            this.database = defaultIfBlank(entity.database(), this.database);
+            if (!entity.name().isBlank()) {
+                this.name = entity.name();
+            }
+            this.isGlobalReportingGroup = this.isGlobalReportingGroup || entity.isGlobalReportingGroup();
+            this.raw = defaultIfBlank(entity.raw(), this.raw);
+
             if (methods.size() < MAX_METHODS_PER_ENTITY || methods.contains(methodName)) {
                 methods.add(methodName);
             }
 
-            if (occurrence.origin() == ValueOrigin.RESPONSE) {
-                producerMethods.add(methodName);
-            } else {
-                consumerMethods.add(methodName);
+            if (seenContexts.size() < MAX_CONTEXTS_PER_ENTITY || seenContexts.contains(entity.contextKey())) {
+                if (entity.contextKey() != null && !entity.contextKey().isBlank()) {
+                    seenContexts.add(entity.contextKey());
+                }
             }
-
-            if (authContexts.size() < MAX_CONTEXTS_PER_ENTITY || authContexts.contains(authContext)) {
-                authContexts.add(authContext);
-            }
-
-            paths.add(occurrence.origin().name().toLowerCase(Locale.ROOT) + ":" + occurrence.path());
 
             if (samples.size() >= MAX_SAMPLES_PER_ENTITY) {
                 samples.removeFirst();
             }
-            samples.addLast("method=" + methodName + " | " + occurrence.origin().name().toLowerCase(Locale.ROOT)
-                    + " | path=" + occurrence.path() + " | value=" + occurrence.preview());
-
-            if (statusCode != null) {
-                statuses.add(statusCode);
-            }
+            samples.addLast("method=" + methodName
+                    + " | context=" + defaultIfBlank(entity.contextKey(), "")
+                    + " | db=" + defaultIfBlank(entity.database(), "")
+                    + " | id=" + entity.entityId());
         }
 
         synchronized EntityRow toRow() {
             RiskComputation risk = computeRisk();
+            EntityType entityType = classifyEntityType(typeName, entityId);
+            String preview = !name.isBlank() ? name : entityId;
             return new EntityRow(
-                    entityKey,
+                    entityId,
                     preview,
                     entityType,
                     observations,
                     methods.size(),
-                    authContexts.size(),
-                    producerMethods.size(),
-                    consumerMethods.size(),
+                    seenContexts.size(),
+                    methods.size(),
+                    0,
                     methods.size() > 1,
-                    authContexts.size() > 1,
+                    seenContexts.size() > 1,
                     firstSeen,
                     lastSeen,
                     risk.score,
@@ -690,12 +672,25 @@ public final class EntityStoreService implements AutoCloseable {
             return new EntityDetails(
                     row,
                     List.copyOf(methods),
-                    List.copyOf(producerMethods),
-                    List.copyOf(consumerMethods),
-                    List.copyOf(authContexts),
-                    List.copyOf(paths),
+                    List.copyOf(methods),
+                    List.of(),
+                    List.copyOf(seenContexts),
+                    List.of(raw),
                     sampleCopy,
                     risk.reasons
+            );
+        }
+
+        synchronized ExtractedEntity toExtractedEntity() {
+            return new ExtractedEntity(
+                    entityId,
+                    defaultIfBlank(typeName, "Unknown"),
+                    defaultIfBlank(database, "unknown-db"),
+                    seenContexts.isEmpty() ? "" : seenContexts.iterator().next(),
+                    name,
+                    isGlobalReportingGroup,
+                    raw,
+                    List.copyOf(seenContexts)
             );
         }
 
@@ -703,14 +698,9 @@ public final class EntityStoreService implements AutoCloseable {
             int score = 0;
             List<String> reasons = new ArrayList<>();
 
-            if (entityType.isSensitive()) {
+            if (classifyEntityType(typeName, entityId).isSensitive()) {
                 score += 20;
-                reasons.add("Sensitive entity type: " + entityType.displayName());
-            }
-
-            if (producerMethods.size() > 0 && consumerMethods.size() > 0) {
-                score += 12;
-                reasons.add("Observed in both response and request payloads.");
+                reasons.add("Sensitive entity type: " + typeName);
             }
 
             if (methods.size() > 1) {
@@ -719,10 +709,10 @@ public final class EntityStoreService implements AutoCloseable {
                 reasons.add("Entity reused across methods: " + methods.size());
             }
 
-            if (authContexts.size() > 1) {
-                int contribution = 18 + Math.min(16, (authContexts.size() - 1) * 2);
+            if (seenContexts.size() > 1) {
+                int contribution = 18 + Math.min(16, (seenContexts.size() - 1) * 2);
                 score += contribution;
-                reasons.add("Entity seen across auth contexts: " + authContexts.size());
+                reasons.add("Entity seen across contexts: " + seenContexts.size());
             }
 
             if (observations >= 5) {
@@ -730,44 +720,45 @@ public final class EntityStoreService implements AutoCloseable {
                 reasons.add("Observed repeatedly in traffic: " + observations + " occurrences.");
             }
 
-            if (statuses.stream().anyMatch(code -> code >= 200 && code < 300)
-                    && statuses.stream().anyMatch(code -> code >= 400 && code < 500)) {
-                score += 10;
-                reasons.add("Entity appears in both success and client-error responses.");
-            }
-
-            if (entityType == EntityType.OBJECT_REFERENCE) {
-                score += 6;
-                reasons.add("Object reference token may map to backend object lookups.");
+            if (isGlobalReportingGroup) {
+                score += 12;
+                reasons.add("Global reporting group observed.");
             }
 
             score = Math.min(score, 100);
             return new RiskComputation(score, SecurityFinding.RiskLevel.fromScore(score), reasons);
+        }
+
+        private static EntityType classifyEntityType(String typeName, String entityId) {
+            String loweredType = typeName == null ? "" : typeName.toLowerCase(Locale.ROOT);
+            String loweredId = entityId == null ? "" : entityId.toLowerCase(Locale.ROOT);
+
+            if (loweredType.contains("user") || loweredId.startsWith("u") || loweredId.startsWith("b1")) {
+                return EntityType.USER_ID;
+            }
+            if (loweredType.contains("group") || loweredId.startsWith("g") || loweredId.startsWith("b29")) {
+                return EntityType.ACCOUNT_ID;
+            }
+            if (loweredType.contains("device")) {
+                return EntityType.DEVICE_ID;
+            }
+            return EntityType.GENERIC_ID;
         }
     }
 
     private record RiskComputation(int score, SecurityFinding.RiskLevel level, List<String> reasons) {
     }
 
-    private static final class LimitedSet<T> extends LinkedHashSet<T> {
-        private final int maxSize;
-
-        private LimitedSet(int maxSize) {
-            this.maxSize = maxSize;
-        }
-
-        @Override
-        public boolean add(T value) {
-            boolean changed = super.add(value);
-            if (size() > maxSize) {
-                Iterator<T> iterator = iterator();
-                if (iterator.hasNext()) {
-                    iterator.next();
-                    iterator.remove();
-                }
-            }
-            return changed;
-        }
+    public record ExtractedEntity(
+            String entityId,
+            String typeName,
+            String database,
+            String contextKey,
+            String name,
+            boolean isGlobalReportingGroup,
+            String raw,
+            List<String> seenInContexts
+    ) {
     }
 
     public record EntityRow(

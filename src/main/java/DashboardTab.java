@@ -21,6 +21,7 @@ import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.table.AbstractTableModel;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableRowSorter;
 import java.awt.BorderLayout;
@@ -67,7 +68,8 @@ public final class DashboardTab extends JPanel {
     private final JTabbedPane detailTabs = new JTabbedPane();
     private final JsonRpcDetailPanel trafficPanel = new JsonRpcDetailPanel();
     private final JTextArea entitiesArea = buildMonoTextArea();
-    private final JTextArea sessionsArea = buildMonoTextArea();
+    private final SessionTableModel sessionsTableModel = new SessionTableModel();
+    private final JTable sessionsTable = new JTable(sessionsTableModel);
 
     private final AtomicBoolean refreshQueued = new AtomicBoolean(false);
     private final Set<String> previouslyKnownMethods = new HashSet<>();
@@ -158,7 +160,7 @@ public final class DashboardTab extends JPanel {
         // Detail sub-tabs
         detailTabs.addTab("\uD83D\uDCE1 Traffic", new JScrollPane(trafficPanel));
         detailTabs.addTab("\uD83D\uDD11 Entities", new JScrollPane(entitiesArea));
-        detailTabs.addTab("\uD83D\uDC64 Sessions", new JScrollPane(sessionsArea));
+        detailTabs.addTab("\uD83D\uDC64 Sessions", buildSessionsPanel());
         detailTabs.setSelectedIndex(0);
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScroll, detailTabs);
@@ -172,6 +174,41 @@ public final class DashboardTab extends JPanel {
         add(controls, BorderLayout.NORTH);
         add(splitPane, BorderLayout.CENTER);
         add(footer, BorderLayout.SOUTH);
+    }
+
+    private JPanel buildSessionsPanel() {
+        JPanel panel = new JPanel(new BorderLayout(4, 4));
+
+        sessionsTable.setFillsViewportHeight(true);
+        sessionsTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        sessionsTable.getColumnModel().getColumn(0).setPreferredWidth(420);
+        sessionsTable.getColumnModel().getColumn(1).setPreferredWidth(170);
+        sessionsTable.getColumnModel().getColumn(2).setPreferredWidth(180);
+        sessionsTable.getColumnModel().getColumn(3).setPreferredWidth(120);
+        sessionsTable.getColumnModel().getColumn(4).setPreferredWidth(110);
+        sessionsTable.getColumnModel().getColumn(5).setPreferredWidth(90);
+        sessionsTable.getColumnModel().getColumn(6).setPreferredWidth(170);
+        sessionsTable.getColumnModel().getColumn(7).setPreferredWidth(260);
+
+        JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
+        JButton markAdminBtn = new JButton("Mark ADMIN");
+        JButton markLowPrivBtn = new JButton("Mark LOW_PRIV");
+        JButton clearRoleBtn = new JButton("Clear Role");
+        JButton refreshBtn = new JButton("Refresh Sessions");
+
+        markAdminBtn.addActionListener(e -> applyRoleToSelectedSession(RoleType.ADMIN));
+        markLowPrivBtn.addActionListener(e -> applyRoleToSelectedSession(RoleType.LOW_PRIV));
+        clearRoleBtn.addActionListener(e -> applyRoleToSelectedSession(RoleType.UNKNOWN));
+        refreshBtn.addActionListener(e -> refreshSessionsPanel());
+
+        controls.add(markAdminBtn);
+        controls.add(markLowPrivBtn);
+        controls.add(clearRoleBtn);
+        controls.add(refreshBtn);
+
+        panel.add(controls, BorderLayout.NORTH);
+        panel.add(new JScrollPane(sessionsTable), BorderLayout.CENTER);
+        return panel;
     }
 
     private void wireEvents() {
@@ -290,35 +327,25 @@ public final class DashboardTab extends JPanel {
     }
 
     private void refreshSessionsPanel() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("=== Detected Auth Sessions ===\n");
-        sb.append("Right-click or use buttons above to mark sessions as ADMIN or LOW_PRIV.\n\n");
+        sessionsTableModel.setRows(authContextStore.snapshotSessions());
+    }
 
-        List<AuthContextStore.AuthContext> contexts = authContextStore.snapshotContexts();
-        if (contexts.isEmpty()) {
-            sb.append("No sessions detected yet. Browse the target application to capture traffic.\n");
+    private void applyRoleToSelectedSession(RoleType roleType) {
+        int viewRow = sessionsTable.getSelectedRow();
+        if (viewRow < 0) {
+            JOptionPane.showMessageDialog(this, "Select a session first.", "No selection", JOptionPane.INFORMATION_MESSAGE);
+            return;
         }
 
-        for (AuthContextStore.AuthContext ctx : contexts) {
-            sb.append("--- ").append(ctx.role().displayName()).append(" ---\n");
-            sb.append("  Context Key: ").append(ctx.contextKey()).append("\n");
-            sb.append("  Database:    ").append(ctx.database()).append("\n");
-            sb.append("  User:        ").append(ctx.userName()).append("\n");
-            sb.append("  Session ID:  ").append(ctx.sessionId().isBlank() ? "(none)" : truncate(ctx.sessionId(), 60)).append("\n");
-            if (!ctx.rawAuthorizationHeader().isBlank()) {
-                sb.append("  Auth Header: ").append(truncate(ctx.rawAuthorizationHeader(), 80)).append("\n");
-            }
-            if (!ctx.rawCookieHeader().isBlank()) {
-                sb.append("  Cookie:      ").append(truncate(ctx.rawCookieHeader(), 80)).append("\n");
-            }
-            if (!ctx.lastSeenUrl().isBlank()) {
-                sb.append("  Last URL:    ").append(ctx.lastSeenUrl()).append("\n");
-            }
-            sb.append("\n");
+        int modelRow = sessionsTable.convertRowIndexToModel(viewRow);
+        AuthContextStore.SessionView session = sessionsTableModel.rowAt(modelRow);
+        boolean updated = authContextStore.setRoleForContextKey(session.contextKey(), roleType);
+        if (!updated) {
+            JOptionPane.showMessageDialog(this, "Unable to update role for selected session.", "Role update failed", JOptionPane.INFORMATION_MESSAGE);
+            return;
         }
 
-        sessionsArea.setText(sb.toString());
-        sessionsArea.setCaretPosition(0);
+        refreshNow();
     }
 
     private void applyRoleToSelectedMethod(RoleType roleType) {
@@ -437,9 +464,60 @@ public final class DashboardTab extends JPanel {
         return area;
     }
 
-    private static String truncate(String value, int maxLen) {
-        if (value == null) return "";
-        return value.length() <= maxLen ? value : value.substring(0, maxLen) + "...";
+    private final class SessionTableModel extends AbstractTableModel {
+        private final String[] columns = {
+                "Context Key",
+                "Session ID",
+                "Database",
+                "User",
+                "Role",
+                "Requests",
+                "Last Seen",
+                "Security Groups"
+        };
+
+        private final List<AuthContextStore.SessionView> rows = new java.util.ArrayList<>();
+
+        @Override
+        public int getRowCount() {
+            return rows.size();
+        }
+
+        @Override
+        public int getColumnCount() {
+            return columns.length;
+        }
+
+        @Override
+        public String getColumnName(int column) {
+            return columns[column];
+        }
+
+        @Override
+        public Object getValueAt(int rowIndex, int columnIndex) {
+            AuthContextStore.SessionView row = rows.get(rowIndex);
+            return switch (columnIndex) {
+                case 0 -> row.contextKey();
+                case 1 -> row.sessionId();
+                case 2 -> row.database();
+                case 3 -> row.userName();
+                case 4 -> row.role().displayName();
+                case 5 -> row.requestCount();
+                case 6 -> row.lastSeen() == null ? "" : timeFormatter.format(row.lastSeen());
+                case 7 -> String.join(", ", row.securityGroups());
+                default -> "";
+            };
+        }
+
+        void setRows(List<AuthContextStore.SessionView> nextRows) {
+            rows.clear();
+            rows.addAll(nextRows);
+            fireTableDataChanged();
+        }
+
+        AuthContextStore.SessionView rowAt(int rowIndex) {
+            return rows.get(rowIndex);
+        }
     }
 
     private final class MethodCellRenderer extends DefaultTableCellRenderer {
@@ -468,6 +546,7 @@ public final class DashboardTab extends JPanel {
                 switch (roleType) {
                     case ADMIN -> component.setForeground(new Color(0, 128, 0));
                     case LOW_PRIV -> component.setForeground(new Color(194, 112, 0));
+                    case MIXED -> component.setForeground(new Color(0, 102, 153));
                     case UNKNOWN -> component.setForeground(new Color(120, 120, 120));
                 }
             } else {

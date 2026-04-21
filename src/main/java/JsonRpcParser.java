@@ -236,8 +236,8 @@ public final class JsonRpcParser {
         }
 
         JsonNode paramsNode = callNode.get("params");
-        if (paramsNode == null) {
-            paramsNode = callNode.path("params");
+        if (paramsNode == null || paramsNode.isNull()) {
+            return null;
         }
 
         String paramsMode = detectParamsMode(paramsNode);

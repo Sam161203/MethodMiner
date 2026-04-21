@@ -3,3 +3,14 @@ build/
 bin/
 *.class
 .vscode/
+.obsidian/
+
+# Local scratch and exports
+.tmp_*
+*.tmp
+*.log
+*.jsonl
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

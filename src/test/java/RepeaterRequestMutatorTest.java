@@ -60,7 +60,7 @@ class RepeaterRequestMutatorTest {
 
     private String buildRawRequest(String body) {
         List<String> headers = List.of(
-                "Host: bugcrowd5.geotab.com",
+                "Host: tenant-a.example.test",
                 "Content-Type: application/json",
                 "Cookie: sessionId=sid-low",
                 "Authorization: Bearer token-low",

@@ -11,11 +11,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.concurrent.locks.ReentrantLock;
 
 public final class StorageManager implements AutoCloseable {
-    private static final Path PREFERRED_LOG_DIRECTORY = Paths.get("D:\\tools\\jsonrpc-logs");
+    private static final String LOG_DIRECTORY_PROPERTY = "logichunter.logDir";
+    private static final String LOG_DIRECTORY_ENV = "LOGICHUNTER_LOG_DIR";
 
     private static final String RAW_FILE_NAME = "jsonrpc-raw.jsonl";
     private static final String NORMALIZED_FILE_NAME = "jsonrpc-normalized.jsonl";
@@ -80,11 +82,11 @@ public final class StorageManager implements AutoCloseable {
     }
 
     public void appendRaw(JsonRpcRecord record) {
-        writeLine(rawPath, rawLock, WriterKind.RAW, toLine(record.toJson(objectMapper)));
+        writeLine(rawPath, rawLock, WriterKind.RAW, toLine(toRawLineNode(record)));
     }
 
-    public void appendNormalized(JsonRpcNormalizedRecord record) {
-        writeLine(normalizedPath, normalizedLock, WriterKind.NORMALIZED, toLine(record.toJson(objectMapper)));
+    public void appendNormalized(JsonRpcNormalizedRecord record, JsonRpcRecord rawRecord) {
+        writeLine(normalizedPath, normalizedLock, WriterKind.NORMALIZED, toLine(toNormalizedLineNode(record, rawRecord)));
     }
 
     public void appendError(ErrorRecord errorRecord) {
@@ -171,20 +173,19 @@ public final class StorageManager implements AutoCloseable {
     }
 
     private Path resolveWritableLogDirectory() {
-        Path preferred = normalize(PREFERRED_LOG_DIRECTORY);
-        if (canUseDirectory(preferred)) {
-            return preferred;
+        Path configured = configuredLogDirectory();
+        if (configured != null && canUseDirectory(configured)) {
+            logging.logToOutput("Using configured JSON-RPC logs directory: " + withTrailingSeparator(configured));
+            return configured;
         }
 
-        Path fallback = normalize(Paths.get(System.getProperty("user.home"), "jsonrpc-logs"));
-        logging.logToError("Preferred JSON-RPC logs directory is unavailable. Using fallback directory: " + withTrailingSeparator(fallback));
-        if (canUseDirectory(fallback)) {
-            logging.logToOutput("Using fallback JSON-RPC logs directory: " + withTrailingSeparator(fallback));
-            return fallback;
+        Path userHomeDefault = normalize(Paths.get(System.getProperty("user.home"), "jsonrpc-logs"));
+        if (canUseDirectory(userHomeDefault)) {
+            logging.logToOutput("Using default JSON-RPC logs directory: " + withTrailingSeparator(userHomeDefault));
+            return userHomeDefault;
         }
 
         Path emergency = normalize(Paths.get(System.getProperty("java.io.tmpdir"), "jsonrpc-logs"));
-        logging.logToError("Fallback JSON-RPC logs directory is unavailable. Attempting emergency directory: " + withTrailingSeparator(emergency));
         if (canUseDirectory(emergency)) {
             logging.logToOutput("Using emergency JSON-RPC logs directory: " + withTrailingSeparator(emergency));
             return emergency;
@@ -196,8 +197,19 @@ public final class StorageManager implements AutoCloseable {
             return tempDir;
         } catch (IOException ex) {
             logging.logToError("Unable to create temporary JSON-RPC logs directory. Falling back to user-home path without guarantees.", ex);
-            return fallback;
+            return userHomeDefault;
         }
+    }
+
+    private Path configuredLogDirectory() {
+        String configured = System.getProperty(LOG_DIRECTORY_PROPERTY, "");
+        if (configured.isBlank()) {
+            configured = System.getenv(LOG_DIRECTORY_ENV);
+        }
+        if (configured == null || configured.isBlank()) {
+            return null;
+        }
+        return normalize(Paths.get(configured));
     }
 
     private boolean canUseDirectory(Path directory) {
@@ -316,6 +328,111 @@ public final class StorageManager implements AutoCloseable {
 
     private static String toLine(JsonNode node) {
         return node.toString();
+    }
+
+    private ObjectNode toRawLineNode(JsonRpcRecord record) {
+        ObjectNode node = record.toJson(objectMapper);
+        CredentialsProjection credentials = extractCredentials(record.request().bodyText());
+        if (credentials != null) {
+            node.put("database", credentials.database());
+            node.put("sessionId", credentials.sessionId());
+            node.put("userName", credentials.userName());
+            node.put("typeName", credentials.typeName());
+            node.put("method", credentials.method());
+
+            ObjectNode credentialsNode = objectMapper.createObjectNode();
+            credentialsNode.put("database", credentials.database());
+            credentialsNode.put("sessionId", credentials.sessionId());
+            credentialsNode.put("userName", credentials.userName());
+            node.set("credentials", credentialsNode);
+        }
+        node.put("responseBodyHash", sha256Hex(record.response().bodyText()));
+        return node;
+    }
+
+    private ObjectNode toNormalizedLineNode(JsonRpcNormalizedRecord record, JsonRpcRecord rawRecord) {
+        ObjectNode node = record.toJson(objectMapper);
+        CredentialsProjection credentials = rawRecord == null ? null : extractCredentials(rawRecord.request().bodyText());
+        if (credentials != null) {
+            node.put("database", credentials.database());
+            node.put("sessionId", credentials.sessionId());
+            node.put("userName", credentials.userName());
+
+            ObjectNode credentialsNode = objectMapper.createObjectNode();
+            credentialsNode.put("database", credentials.database());
+            credentialsNode.put("sessionId", credentials.sessionId());
+            credentialsNode.put("userName", credentials.userName());
+            node.set("credentials", credentialsNode);
+        }
+        String responseBody = rawRecord == null || rawRecord.response() == null ? "" : rawRecord.response().bodyText();
+        node.put("responseBodyHash", sha256Hex(responseBody));
+        return node;
+    }
+
+    private CredentialsProjection extractCredentials(String requestBody) {
+        if (requestBody == null || requestBody.isBlank()) {
+            return null;
+        }
+
+        try {
+            JsonNode root = objectMapper.readTree(requestBody);
+            JsonNode call = root;
+            if (root.isArray() && root.size() > 0 && root.get(0).isObject()) {
+                call = root.get(0);
+            }
+            if (call == null || !call.isObject()) {
+                return null;
+            }
+
+            JsonNode params = call.path("params");
+            if (!params.isObject()) {
+                return null;
+            }
+
+            JsonNode credentials = params.path("credentials");
+            if (!credentials.isObject()) {
+                return null;
+            }
+
+            String sessionId = credentials.path("sessionId").asText("").trim();
+            if (sessionId.isBlank()) {
+                return null;
+            }
+
+            return new CredentialsProjection(
+                    credentials.path("database").asText("").trim(),
+                    sessionId,
+                    credentials.path("userName").asText("").trim(),
+                    params.path("typeName").asText("").trim(),
+                    call.path("method").asText("").trim()
+            );
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String sha256Hex(String value) {
+        String source = value == null ? "" : value;
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(source.getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder();
+            for (byte b : bytes) {
+                builder.append(String.format("%02x", b));
+            }
+            return builder.toString();
+        } catch (Exception ignored) {
+            return Integer.toHexString(source.hashCode());
+        }
+    }
+
+    private record CredentialsProjection(
+            String database,
+            String sessionId,
+            String userName,
+            String typeName,
+            String method
+    ) {
     }
 
     private void recreateLogFile(Path path) {
