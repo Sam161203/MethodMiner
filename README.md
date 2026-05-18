@@ -1,177 +1,220 @@
-# Method Miner (Burp Suite Extension)
+# Method Miner
 
-Method Miner is a passive Burp Suite extension (Montoya API) designed for analyzing JSON-RPC APIs and identifying **business logic flaws, access control issues, and workflow abuse**.
+Method Miner is a passive :contentReference[oaicite:0]{index=0} extension built with the Montoya API for analyzing API traffic and generating actionable intelligence for business logic and access control testing.
+
+It automatically discovers and correlates:
+
+- JSON-RPC APIs
+- GraphQL APIs
+- Authentication sessions
+- Role differences (ADMIN vs LOW_PRIV)
+- Privilege boundaries
+- High-risk operations
+- Repeater-ready payload templates
+
+Method Miner is designed to accelerate manual bug hunting for vulnerabilities such as IDOR/BOLA, broken access control, privilege escalation, cross-tenant access, and workflow abuse.
 
 ---
 
-## ⚠️ Project Status
+## 🚧 Project Status
 
-> 🚧 This project is **actively under development**.
+> Method Miner is actively under development.
 
-* Core pipeline (capture, parsing, session tracking) is stable
-* Analysis and suggestion engine are still evolving
-* Some behaviors (session handling, correlation logic) are being refined
+The core architecture and passive analysis pipeline are stable, and the extension is fully usable for real-world API reconnaissance. However, several intelligence features are still being refined.
 
-Use this tool as a **research assistant**, not a fully automated scanner.
+### Stable Components
+
+- Passive JSON-RPC and GraphQL traffic capture
+- Session discovery and role labeling
+- Schema extraction and evidence correlation
+- Role comparison (ADMIN vs LOW_PRIV)
+- Risk signal generation
+- Payload assembly
+- Export system (Markdown, JSON, JSONL, CSV)
+- Project lifecycle management
+- Unified Burp UI
+
+### Areas Under Active Improvement
+
+- Risk scoring and prioritization logic
+- Attack suggestion quality
+- Payload generation accuracy
+- Cross-operation correlation
+- Business logic chain detection
+- Heuristic tuning to reduce false positives
+
+### Current Recommendation
+
+Method Miner should be used as a **security research assistant** rather than a fully automated vulnerability finder.
+
+It excels at:
+
+- Organizing large API surfaces
+- Highlighting privilege differences
+- Generating testing hypotheses
+- Preparing Repeater-ready payloads
+
+Final vulnerability validation and exploitation remain manual and analyst-driven.
+
+### Contributions Welcome
+
+Feedback, bug reports, and pull requests are highly encouraged. Contributions are especially welcome in:
+
+- Improved detection heuristics
+- Better risk prioritization
+- Additional protocol support (REST, gRPC-Web)
+- UI refinements
+- Test coverage expansion
+- Documentation
 
 ---
 
 ## 🎯 Purpose
 
-Testing JSON-RPC APIs manually is repetitive:
+Modern APIs often expose hundreds of operations across multiple protocols. Manually identifying privilege differences and attack paths is time-consuming.
 
-1. Login as ADMIN → capture traffic
-2. Login as LOW PRIV → capture traffic
-3. Compare behavior manually
+A typical manual workflow requires:
 
-Method Miner automates the **analysis layer**, not exploitation.
+1. Logging in as a low-privileged user
+2. Capturing application behavior
+3. Logging in as an administrator
+4. Repeating the same workflow
+5. Comparing requests manually
+6. Building payloads in Repeater
 
----
-
-## ⚙️ Features
-
-* Passive JSON-RPC traffic capture
-* Session tracking using:
-
-  * host
-  * database
-  * sessionId
-  * userName
-* Role marking (ADMIN / LOW_PRIV)
-* Entity extraction (IDs, groups, objects)
-* Attack suggestion generation (in progress)
-* Repeater-ready payload generation
+Method Miner automates the analysis layer by transforming captured traffic into structured intelligence.
 
 ---
 
-## 🔐 Testing Workflow
+## ⚙️ Core Capabilities
 
-Typical usage:
+### Protocol Detection
 
-1. Login as LOW_PRIV user
+- Passive JSON-RPC detection and schema extraction
+- Passive GraphQL detection and operation parsing
+- Protocol-agnostic ingestion pipeline
 
-2. Browse application → capture traffic
+### Session Intelligence
 
-3. Mark session as LOW_PRIV
+- Automatic session fingerprinting
+- Cookie and authentication metadata extraction
+- Role labeling (ADMIN, LOW_PRIV, UNKNOWN)
+- Cross-session comparison
 
-4. Logout
+### Role Comparison
 
-5. Login as ADMIN
+- Detect operations observed only under privileged roles
+- Parameter-level coverage analysis
+- Highlight likely access control gaps
 
-6. Browse application → capture traffic
+### Risk Signals
 
-7. Mark session as ADMIN
+Generate prioritized testing hypotheses for:
 
-8. Analyze differences in Attack Planner
+- IDOR / BOLA
+- Privilege escalation
+- Cross-tenant access
+- Workflow abuse
+- Batch chaining via `ExecuteMultiCall`
+- Sensitive data exposure
 
----
+### Payload Assembly
 
-## 🧠 What It Helps Find
+Create copy-ready templates for:
 
-* IDOR / BOLA
-* Privilege escalation
-* Broken access control
-* Cross-tenant access
-* Multicall abuse
-* Workflow chaining vulnerabilities
+- JSON request bodies
+- Raw HTTP requests
+- cURL commands
+- Multi-step reproduction workflows
 
----
+### Intelligence Export
 
-## 🚫 What It Does NOT Do
+Export findings in:
 
-* No active scanning
-* No fuzzing
-* No brute force
-* No automatic exploitation
-
-You stay in control (Burp Repeater workflow).
-
----
-
-## 🧩 How It Works
-
-```id="a6w2op"
-traffic → parsing → context → entity tracking → analysis → suggestions
-```
-
-* Requests are captured passively
-* Sessions are separated by context
-* Entities are extracted and tracked
-* Differences between roles are analyzed
-* Suggestions are generated based on observed behavior
+- Markdown
+- JSON
+- JSONL
+- CSV
 
 ---
 
-## 📦 Build
+## 🔐 Typical Workflow
 
-Requirements:
-
-* JDK 21+
-
-```bash
-./gradlew build
-./gradlew jar
-```
-
-Output:
-
-```
-build/libs/method-miner.jar
-```
-
----
-
-## 🔌 Load in Burp
-
-1. Extensions → Installed
-2. Add → Select JAR
-3. Confirm:
-
-  * Method Miner - Dashboard
-  * Method Miner - Attack Planner
+1. Launch Burp Suite
+2. Load Method Miner
+3. Authenticate as LOW_PRIV
+4. Browse the target application
+5. Mark the discovered session as LOW_PRIV
+6. Authenticate as ADMIN
+7. Browse the same application areas
+8. Mark the discovered session as ADMIN
+9. Review:
+   - Risk Signals
+   - Payloads
+   - Comparison
+   - Sessions
+10. Export actionable intelligence
 
 ---
 
-## 🧾 Data Storage
+## 🧠 What It Helps Identify
 
-Logs stored in:
-
-```
-%USERPROFILE%\jsonrpc-logs\
-```
-
-Contains:
-
-* raw traffic
-* normalized data
-* error logs
+- IDOR / BOLA
+- Broken Access Control
+- Privilege Escalation
+- Cross-Tenant Data Access
+- Workflow Chaining Vulnerabilities
+- ExecuteMultiCall Abuse
+- Hidden Administrative Operations
+- Sensitive GraphQL Queries and Mutations
 
 ---
 
-## 📌 Current Limitations
+## 🛡️ Safety Model
 
-* Suggestion engine is still improving
-* Context correlation may miss complex chains
-* Some edge cases in session handling
+Method Miner is strictly passive.
+
+### It Does
+
+- Observe Burp traffic
+- Build schemas and relationships
+- Compare roles
+- Generate testing payloads
+- Export structured intelligence
+
+### It Does Not
+
+- Send active requests
+- Fuzz parameters
+- Brute force operations
+- Modify traffic
+- Exploit vulnerabilities automatically
+
+All exploitation remains under analyst control using Burp Repeater.
 
 ---
 
-## 🚀 Future Work
+## 🏗️ Architecture Overview
 
-* Stronger exploit-chain detection
-* Better cross-context comparison
-* Improved session persistence
-* More accurate prioritization of findings
-
----
-
-## ⚠️ Disclaimer
-
-This tool is for **authorized security testing only**.
-Use responsibly and follow program rules.
-
----
-
-## 🤝 Contribution
-
-This project is evolving — feedback, ideas, and improvements are welcome.
+```text
+Burp Traffic
+    ↓
+BurpTrafficBridge
+    ↓
+TrafficIngestor
+    ↓
+CompositeProtocolDetector
+    ↓
+Protocol Analyzers (JSON-RPC / GraphQL)
+    ↓
+Surface Repository
+    ↓
+Session Extraction
+    ↓
+Role Comparison
+    ↓
+Risk Signal Generation
+    ↓
+Payload Assembly
+    ↓
+Export Engine
