@@ -1,6 +1,6 @@
-# LogicHunter (Burp Suite Extension)
+# Method Miner (Burp Suite Extension)
 
-LogicHunter is a passive Burp Suite extension (Montoya API) designed for analyzing JSON-RPC APIs and identifying **business logic flaws, access control issues, and workflow abuse**.
+Method Miner is a passive Burp Suite extension (Montoya API) designed for analyzing JSON-RPC APIs and identifying **business logic flaws, access control issues, and workflow abuse**.
 
 ---
 
@@ -24,7 +24,7 @@ Testing JSON-RPC APIs manually is repetitive:
 2. Login as LOW PRIV → capture traffic
 3. Compare behavior manually
 
-LogicHunter automates the **analysis layer**, not exploitation.
+Method Miner automates the **analysis layer**, not exploitation.
 
 ---
 
@@ -116,7 +116,7 @@ Requirements:
 Output:
 
 ```
-build/libs/logic-hunter.jar
+build/libs/method-miner.jar
 ```
 
 ---
@@ -127,8 +127,8 @@ build/libs/logic-hunter.jar
 2. Add → Select JAR
 3. Confirm:
 
-   * LogicHunter - Dashboard
-   * LogicHunter - Attack Planner
+  * Method Miner - Dashboard
+  * Method Miner - Attack Planner
 
 ---
 

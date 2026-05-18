@@ -2,156 +2,90 @@ import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.methodminer.burp.BurpTrafficBridge;
+import com.methodminer.burp.TrafficIngestor;
+import com.methodminer.core.ProjectLifecycleManager;
+import com.methodminer.core.events.SimpleEventBus;
+import com.methodminer.core.repository.InMemorySurfaceRepository;
+import com.methodminer.protocol.CompositeProtocolDetector;
+import com.methodminer.protocol.ProtocolDetector;
+import com.methodminer.protocol.graphql.GraphQlProtocolAnalyzer;
+import com.methodminer.protocol.graphql.GraphQlProtocolDetector;
+import com.methodminer.protocol.jsonrpc.JsonRpcProtocolAnalyzer;
+import com.methodminer.protocol.jsonrpc.JsonRpcProtocolDetector;
+import com.methodminer.session.InMemorySessionRepository;
+import com.methodminer.session.SessionExtractor;
+import com.methodminer.ui.MethodMinerTab;
+
+import java.util.List;
 
 public class Extension implements BurpExtension {
-    private JsonRpcCollector collector;
-    private SecurityAnalyzerService securityAnalyzer;
-    private WorkflowGraphService workflowGraphService;
-    private EntityStoreService entityStoreService;
-    private AttackSuggestionService attackSuggestionService;
-    private AttackExecutionService attackExecutionService;
-    private AuthContextStore authContextStore;
-    private LogicHunterExportService exportService;
-    private Registration httpHandlerRegistration;
-    private Registration dashboardTabRegistration;
-    private Registration attackPlannerTabRegistration;
+    private Registration v2BridgeRegistration;
+    private Registration methodMinerTabRegistration;
     private Registration unloadRegistration;
 
     @Override
     public void initialize(MontoyaApi montoyaApi) {
-        montoyaApi.extension().setName("LogicHunter");
+        montoyaApi.extension().setName("Method Miner");
 
         ObjectMapper objectMapper = new ObjectMapper();
-        StorageManager storageManager = new StorageManager(
-                montoyaApi.extension().filename(),
-                objectMapper,
-                montoyaApi.logging()
-        );
-        JsonRpcIndex index = new JsonRpcIndex();
-        authContextStore = new AuthContextStore(objectMapper);
-        collector = new JsonRpcCollector(montoyaApi, storageManager, index, authContextStore, objectMapper);
-        registerHttpHandler(montoyaApi);
 
-        securityAnalyzer = new SecurityAnalyzerService(objectMapper, index, authContextStore, montoyaApi.logging());
-        workflowGraphService = new WorkflowGraphService(objectMapper, montoyaApi.logging(), authContextStore);
-        entityStoreService = new EntityStoreService(objectMapper, montoyaApi.logging(), authContextStore);
-        attackSuggestionService = new AttackSuggestionService(
-            objectMapper,
-            index,
-            securityAnalyzer,
-            workflowGraphService,
-            entityStoreService,
-            authContextStore,
-            montoyaApi.logging()
-        );
-        attackExecutionService = AttackExecutionService.create(
-                montoyaApi,
-                objectMapper,
-                authContextStore,
-                entityStoreService,
-                index
-        );
-        attackSuggestionService.setAttackExecutionService(attackExecutionService);
-            exportService = new LogicHunterExportService(
-                objectMapper,
-                authContextStore,
-                index,
-                securityAnalyzer,
-                entityStoreService,
-                attackSuggestionService,
-                workflowGraphService
-            );
+        // v2 passive ingestion pipeline: JSON-RPC + GraphQL -> unified ApiSurface model
+        SimpleEventBus v2EventBus = new SimpleEventBus();
+        InMemorySurfaceRepository v2SurfaceRepository = new InMemorySurfaceRepository("Method Miner");
+        ProtocolDetector v2ProtocolDetector = new CompositeProtocolDetector(List.of(
+            new JsonRpcProtocolDetector(objectMapper),
+            new GraphQlProtocolDetector(objectMapper)
+        ));
+        JsonRpcProtocolAnalyzer v2JsonRpcAnalyzer = new JsonRpcProtocolAnalyzer(objectMapper);
+        GraphQlProtocolAnalyzer v2GraphQlAnalyzer = new GraphQlProtocolAnalyzer(objectMapper);
+        SessionExtractor v2SessionExtractor = new SessionExtractor(objectMapper);
+        InMemorySessionRepository v2SessionRepository = new InMemorySessionRepository();
 
-        // Consolidated 2-tab UI: Dashboard + Attack Planner
-        DashboardTab dashboardTab = new DashboardTab(
-                montoyaApi, collector, index, authContextStore,
-                entityStoreService, exportService, objectMapper
+        // Guarantee clean in-memory state on every extension load,
+        // even if Burp hot-reloads without a full JVM restart.
+        v2SurfaceRepository.clear();
+        v2SessionRepository.clear();
+        TrafficIngestor v2TrafficIngestor = new TrafficIngestor(
+            v2ProtocolDetector,
+            v2JsonRpcAnalyzer,
+            v2GraphQlAnalyzer,
+            v2SurfaceRepository,
+            v2EventBus,
+            v2SessionExtractor,
+            v2SessionRepository
         );
-        AttackPlannerTab attackPlannerTab = new AttackPlannerTab(
-                montoyaApi, attackSuggestionService, securityAnalyzer,
-                workflowGraphService, authContextStore, collector, index, objectMapper
+
+        // Register the v2 bridge handler — feeds ALL Burp traffic into the v2 pipeline
+        // (protocol detection and filtering are performed by the v2 pipeline itself).
+        BurpTrafficBridge v2Bridge = new BurpTrafficBridge(v2TrafficIngestor, montoyaApi.logging());
+        v2BridgeRegistration = montoyaApi.http().registerHttpHandler(v2Bridge);
+
+        ProjectLifecycleManager lifecycleManager = new ProjectLifecycleManager(
+                v2SurfaceRepository,
+                v2SessionRepository,
+                v2EventBus
         );
-        montoyaApi.userInterface().applyThemeToComponent(dashboardTab);
-        montoyaApi.userInterface().applyThemeToComponent(attackPlannerTab);
 
-        collector.registerIndexUpdateListener(dashboardTab::requestRefreshAsync);
-        collector.registerIndexUpdateListener(attackSuggestionService::requestRecomputeAsync);
-        collector.registerRecordListener((rawRecord, normalizedRecord, replayed) ->
-            authContextStore.observeRecord(rawRecord, normalizedRecord.methodName())
+        MethodMinerTab methodMinerTab = new MethodMinerTab(
+                v2EventBus,
+                v2SurfaceRepository,
+                v2SessionRepository,
+                lifecycleManager
         );
-        collector.registerRecordListener(securityAnalyzer::ingestRecordAsync);
-        collector.registerRecordListener(workflowGraphService::ingestRecordAsync);
-        collector.registerRecordListener(entityStoreService::ingestRecordAsync);
-        collector.registerRecordListener(attackSuggestionService::ingestRecordAsync);
-        collector.registerResetListener(authContextStore::clear);
-        collector.registerResetListener(securityAnalyzer::clear);
-        collector.registerResetListener(workflowGraphService::clear);
-        collector.registerResetListener(entityStoreService::clear);
-        collector.registerResetListener(attackSuggestionService::clear);
+        montoyaApi.userInterface().applyThemeToComponent(methodMinerTab);
 
-        authContextStore.registerUpdateListener(dashboardTab::requestRefreshAsync);
-        authContextStore.registerUpdateListener(attackSuggestionService::requestRecomputeAsync);
-        authContextStore.registerUpdateListener(attackPlannerTab::requestRefreshAsync);
-
-        securityAnalyzer.registerUpdateListener(attackPlannerTab::requestRefreshAsync);
-        workflowGraphService.registerUpdateListener(attackPlannerTab::requestRefreshAsync);
-        entityStoreService.registerUpdateListener(dashboardTab::requestRefreshAsync);
-        attackSuggestionService.registerUpdateListener(attackPlannerTab::requestRefreshAsync);
-
-        dashboardTabRegistration = montoyaApi.userInterface().registerSuiteTab("LogicHunter - Dashboard", dashboardTab);
-        attackPlannerTabRegistration = montoyaApi.userInterface().registerSuiteTab("LogicHunter - Attack Planner", attackPlannerTab);
+        // Register only the unified v2 Method Miner tab.
+        methodMinerTabRegistration = montoyaApi.userInterface().registerSuiteTab(MethodMinerTab.TAB_TITLE, methodMinerTab);
         unloadRegistration = montoyaApi.extension().registerUnloadingHandler(this::shutdown);
 
-        collector.warmIndexFromDiskAsync();
-
-        attackSuggestionService.requestRecomputeAsync();
-
-        montoyaApi.logging().logToOutput("LogicHunter started. Data directory: " + storageManager.dataDirectory());
-    }
-
-    private void registerHttpHandler(MontoyaApi montoyaApi) {
-        if (collector == null) {
-            montoyaApi.logging().logToError("[LogicHunter] HTTP handler registration skipped: collector is null");
-            return;
-        }
-
-        try {
-            if (httpHandlerRegistration != null && httpHandlerRegistration.isRegistered()) {
-                httpHandlerRegistration.deregister();
-            }
-
-            httpHandlerRegistration = montoyaApi.http().registerHttpHandler(collector);
-            if (httpHandlerRegistration != null && httpHandlerRegistration.isRegistered()) {
-                montoyaApi.logging().logToOutput("[LogicHunter] HTTP handler registered");
-            } else {
-                montoyaApi.logging().logToError("[LogicHunter] HTTP handler registration failed: registration not active");
-            }
-        } catch (Exception ex) {
-            montoyaApi.logging().logToError("[LogicHunter] HTTP handler registration failed", ex);
-        }
+        montoyaApi.logging().logToOutput("Method Miner started (v2-only).");
     }
 
     private void shutdown() {
-        safeDeregister(httpHandlerRegistration);
-        safeDeregister(dashboardTabRegistration);
-        safeDeregister(attackPlannerTabRegistration);
+        safeDeregister(v2BridgeRegistration);
+        safeDeregister(methodMinerTabRegistration);
         safeDeregister(unloadRegistration);
-
-        if (collector != null) {
-            collector.close();
-        }
-        if (securityAnalyzer != null) {
-            securityAnalyzer.close();
-        }
-        if (workflowGraphService != null) {
-            workflowGraphService.close();
-        }
-        if (entityStoreService != null) {
-            entityStoreService.close();
-        }
-        if (attackSuggestionService != null) {
-            attackSuggestionService.close();
-        }
     }
 
     private static void safeDeregister(Registration registration) {

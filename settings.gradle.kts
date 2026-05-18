@@ -1,1 +1,1 @@
-rootProject.name = "logic-hunter"
+rootProject.name = "method-miner"
